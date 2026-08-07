@@ -13,8 +13,6 @@ int main(int argc, char **argv) {
   SharedMem coromem;
   commandLine cmd(argc, argv, "Usage : \n");
   RdmaParameter rdma_param(cmd);
-  auto &tp = getThreadPool();
-  tp.poolPause();
 
   IndexParameter index_param(argc, argv);
 
@@ -41,8 +39,6 @@ int main(int argc, char **argv) {
   //   return 0;
   // }
   
-  tp.poolContiue();
-
   if (index_param.graph_type == GraphType::SCALA_V3){
     scala_build.write_partition_info();
 
