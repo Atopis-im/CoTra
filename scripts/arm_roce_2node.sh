@@ -613,6 +613,10 @@ runtime_preflight() {
   [[ $locked == unlimited ]] ||
     die "max locked memory must be unlimited for this first RDMA run; found ${locked}"
   export OMP_NUM_THREADS=$THREADS
+  export OMP_THREAD_LIMIT=$THREADS
+  export OMP_DYNAMIC=FALSE
+  export OMP_PROC_BIND=FALSE
+  unset GOMP_CPU_AFFINITY
   export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-$THREADS}
 }
 

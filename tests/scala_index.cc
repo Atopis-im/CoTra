@@ -22,22 +22,22 @@ int main(int argc, char **argv) {
   // Start rdma server.
   scala_build.init_rdma();
 
+  // ThreadPool pins the main thread to its first CPU during construction.
+  // RDMA initialization needs those workers to remain alive, but release the
+  // main thread before partition() creates the GNU OpenMP worker pool. OpenMP
+  // workers retain the affinity they inherit when they are first created.
+  if (!unbindThreadSelf()) {
+    std::cerr << "Failed to release main-thread CPU affinity before index "
+                 "partitioning.\n";
+    return 1;
+  }
+
   // Start to do partition and dispatch.
   scala_build.partition();
 
   
   // Build local partition index.
   scala_build.swap_partition_info();
-
-  // ThreadPool pins the main thread to its first CPU during construction.
-  // Release only the main thread here, after the RDMA setup and partition
-  // exchange have completed, so OpenMP workers inherit the full CPU set.
-  // Keep the ThreadPool workers alive because RDMA still uses them.
-  if (!unbindThreadSelf()) {
-    std::cerr << "Failed to release main-thread CPU affinity before index "
-                 "build.\n";
-    return 1;
-  }
 
   scala_build.build();
 

@@ -1301,6 +1301,10 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
 #pragma omp parallel for schedule(dynamic, 2048)
     for (int64_t node_ctr = 0; node_ctr < (int64_t)(visit_order.size()); node_ctr++)
     {
+        if (node_ctr == 0)
+        {
+            diskann::cout << "OpenMP index build threads: " << omp_get_num_threads() << std::endl;
+        }
         auto node = visit_order[node_ctr];
 
         // Find and add appropriate graph edges
