@@ -22,6 +22,8 @@ RDMA_DEVICE="${RDMA_DEVICE:-mlx5_0}"
 IB_PORT="${IB_PORT:-1}"
 GID_INDEX="${GID_INDEX:-}"
 THREADS="${THREADS:-8}"
+INDEX_THREADS="${INDEX_THREADS:-$THREADS}"
+RDMA_THREADS="${RDMA_THREADS:-$THREADS}"
 BUILD_JOBS="${BUILD_JOBS:-24}"
 BARRIER_TIMEOUT="${BARRIER_TIMEOUT:-1800}"
 SEARCH_DRAM_GB="${SEARCH_DRAM_GB:-16}"
@@ -65,7 +67,9 @@ usage() {
     "  --gt-file PATH       Override automatic GT bin discovery." \
     "  --output-dir PATH    Shared index directory." \
     "  --build-dir PATH     Per-host CMake build directory." \
-    "  --threads N          Runtime worker count. Default: 8" \
+    "  --threads N          Set both index and RDMA threads (legacy)." \
+    "  --index-threads N    DiskANN/OpenMP build threads. Default: 8" \
+    "  --rdma-threads N     CoTra/RDMA worker threads. Default: 8" \
     "  --build-jobs N       Parallel compile jobs. Default: 24" \
     "  --gid-index N        Override automatic RoCE GID selection." \
     "  --help               Show this message." \
@@ -155,6 +159,16 @@ while (($# > 0)); do
       ;;
     --threads)
       THREADS=${2:?missing value for --threads}
+      INDEX_THREADS=$THREADS
+      RDMA_THREADS=$THREADS
+      shift 2
+      ;;
+    --index-threads)
+      INDEX_THREADS=${2:?missing value for --index-threads}
+      shift 2
+      ;;
+    --rdma-threads)
+      RDMA_THREADS=${2:?missing value for --rdma-threads}
       shift 2
       ;;
     --build-jobs)
@@ -203,7 +217,8 @@ validate_arguments() {
     die "use one RoCE /24 for the first run: ${NODE0_RDMA_IP}, ${NODE1_RDMA_IP}"
 
   for pair in \
-    "threads:${THREADS}" \
+    "index threads:${INDEX_THREADS}" \
+    "RDMA threads:${RDMA_THREADS}" \
     "build jobs:${BUILD_JOBS}" \
     "memcached port:${MEMCACHED_PORT}" \
     "IB port:${IB_PORT}" \
@@ -213,7 +228,9 @@ validate_arguments() {
     is_positive_integer "$value" || die "${name} must be a positive integer"
   done
   ((MEMCACHED_PORT <= 65535)) || die "memcached port is too large"
-  ((THREADS <= 128)) || die "threads must not exceed COTRA_MAX_THREAD_NUM=128"
+  ((INDEX_THREADS <= 128)) || die "index threads must not exceed 128"
+  ((RDMA_THREADS <= 128)) ||
+    die "RDMA threads must not exceed COTRA_MAX_THREAD_NUM=128"
   if [[ -n $GID_INDEX ]]; then
     is_nonnegative_integer "$GID_INDEX" || die "GID index must be non-negative"
   fi
@@ -612,12 +629,16 @@ runtime_preflight() {
   locked=$(ulimit -l)
   [[ $locked == unlimited ]] ||
     die "max locked memory must be unlimited for this first RDMA run; found ${locked}"
-  export OMP_NUM_THREADS=$THREADS
-  export OMP_THREAD_LIMIT=$THREADS
+  local omp_threads=$RDMA_THREADS
+  if [[ $MODE == index ]]; then
+    omp_threads=$INDEX_THREADS
+  fi
+  export OMP_NUM_THREADS=$omp_threads
+  export OMP_THREAD_LIMIT=$omp_threads
   export OMP_DYNAMIC=FALSE
   export OMP_PROC_BIND=FALSE
   unset GOMP_CPU_AFFINITY
-  export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-$THREADS}
+  export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-$omp_threads}
 }
 
 reset_metadata() {
@@ -660,8 +681,8 @@ run_index() {
     -L "$BUILD_L"
     -B "$SEARCH_DRAM_GB"
     -M "$BUILD_DRAM_GB"
-    -T "$THREADS"
-    -t "$THREADS"
+    -T "$INDEX_THREADS"
+    -t "$RDMA_THREADS"
     -s "$MILLION"
     --scala_v3
     --scalagraph_v2
@@ -705,8 +726,8 @@ run_search() {
     -L "$BUILD_L"
     -B "$SEARCH_DRAM_GB"
     -M "$BUILD_DRAM_GB"
-    -T "$THREADS"
-    -t "$THREADS"
+    -T "$INDEX_THREADS"
+    -t "$RDMA_THREADS"
     -s "$MILLION"
     --scala_v3
     "${RDMA_ARGS[@]}"
