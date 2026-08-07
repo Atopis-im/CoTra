@@ -161,6 +161,39 @@ The index output directory must be visible at the same path on all nodes (for
 example, a shared NFS or parallel filesystem), because the coordinator reads
 the shard files written by the other nodes during index merging.
 
+### Two-node Kunpeng GIST 1M smoke run
+
+`scripts/arm_roce_2node.sh` checks the compiler and development headers,
+prints the RoCE GID table, validates the GIST bin headers and sizes, generates
+the two-node configuration, builds CoTra, and runs indexing or search. It uses
+the reported node 0 defaults `71.54.52.21` (memcached) and `33.40.10.121`
+(RoCE). Supply node 1's RoCE address on both hosts:
+
+```bash
+export NODE1_RDMA_IP=<node-1-33.40.x.x-address>
+
+# Run on both nodes. Rerun check after both have written the shared-path marker.
+bash scripts/arm_roce_2node.sh check
+
+# Build separately on both nodes; per-host build directories avoid collisions.
+bash scripts/arm_roce_2node.sh build
+
+# Start on node 0 first, then node 1; wait for both commands to exit.
+bash scripts/arm_roce_2node.sh index
+
+# Only after indexing succeeded on both: start search on node 0, then node 1.
+bash scripts/arm_roce_2node.sh search
+```
+
+The default dataset directory is
+`/home/team/alg_mathlib/c30061081/gist_1M_960`. Exact `base.bin`,
+`query.bin`, and `gt.bin` names are preferred; otherwise the script selects a
+single matching file for each role. Use `--base-file`, `--query-file`, or
+`--gt-file` when a role has multiple matches. The default shared output is the
+`cotra_2node_index` subdirectory of the dataset directory, and the first run
+uses eight worker threads. Run `bash scripts/arm_roce_2node.sh --help` for all
+overrides, including a fixed GID index.
+
 User can edit the scripts in ./scripts/dataset/ to adjust system configuration.
 We provide different implementations discribed in paper, including **single_machine**, **global_index**, 
 **shard_index(Random)**, **shard_index(Kmeans)**, and **CoTra**.
