@@ -380,11 +380,16 @@ check_headers() {
 
 read_text_file() {
   local path=$1
-  if [[ -r $path ]]; then
-    tr -d '\n' <"$path"
-  else
+  local value
+  if [[ ! -r $path ]]; then
     printf 'unknown'
+    return
   fi
+  if ! value=$(cat -- "$path" 2>/dev/null); then
+    printf 'unavailable'
+    return
+  fi
+  printf '%s' "${value//$'\n'/}"
 }
 
 check_rdma() {
@@ -405,12 +410,14 @@ check_rdma() {
     [[ -e $gid_file ]] || continue
     index=${gid_file##*/}
     gid=$(read_text_file "$gid_file")
+    if [[ ! $gid =~ ^([[:xdigit:]]{4}:){7}[[:xdigit:]]{4}$ ||
+      $gid == 0000:0000:0000:0000:0000:0000:0000:0000 ]]; then
+      continue
+    fi
     type=$(read_text_file "${port_root}/gid_attrs/types/${index}")
     netdev=$(read_text_file "${port_root}/gid_attrs/ndevs/${index}")
     printf '%s gid=%s type=%s netdev=%s\n' "$index" "$gid" "$type" "$netdev"
-    if [[ $gid != 0000:0000:0000:0000:0000:0000:0000:0000 ]]; then
-      gid_count=$((gid_count + 1))
-    fi
+    gid_count=$((gid_count + 1))
   done
   ((gid_count > 0)) || die "the selected RoCE port has no non-empty GID"
 
