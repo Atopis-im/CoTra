@@ -18,7 +18,7 @@ This project is an implementation of a high-performance distributed similarity v
 - **Operating System**: Linux with a working InfiniBand or RoCE device.
 - **Architecture**: x86-64 or AArch64. The AArch64 path does not require AVX,
   Intel MKL, or FAISS.
-- **Build tools**: CMake 3.16+ and GCC 11+ (C++20 coroutines are required).
+- **Build tools**: CMake 3.16+ and GCC 10.3+ (C++20 coroutines are required).
 - **Libraries**: libibverbs, librdmacm, libnuma, libmemcached, Boost
   (serialization, iostreams, program_options, system, filesystem), fmt,
   OpenMP, OpenBLAS/CBLAS, LAPACK, LAPACKE, and libaio.
@@ -46,7 +46,9 @@ On Kylin/RHEL-like systems, ask the administrator to provide the equivalent
 `librdmacm-devel`, `numactl-devel`, `libmemcached-devel`, `boost-devel`,
 `fmt-devel`, `openblas-devel`, `lapack-devel`, `lapacke-devel`, and
 `libaio-devel`. A site module, Software Collections, or Spack compiler is fine;
-the compiler selected by CMake must be GCC 11 or newer.
+the compiler selected by CMake must be GCC 10.3 or newer. GCC 10 builds add
+the required experimental `-fcoroutines` flag automatically; GCC 11 and newer
+use their normal C++20 coroutine mode.
 
 2. **Build the Project**
 

@@ -33,6 +33,7 @@ LOCAL_NODE_ID=""
 CMAKE_BIN=""
 CC_BIN=""
 CXX_BIN=""
+CXX_COMPAT_FLAGS=()
 CONFIG_FILE=""
 BASE_ROWS=0
 BASE_DIM=0
@@ -287,16 +288,20 @@ find_toolchain() {
   CXX_BIN=$(resolve_executable "$CXX_BIN")
   CMAKE_BIN=$(resolve_executable "$CMAKE_BIN")
 
-  [[ -n $CC_BIN && -x $CC_BIN ]] || die "GCC was not found; load/install GCC 11+"
-  [[ -n $CXX_BIN && -x $CXX_BIN ]] || die "G++ was not found; load/install GCC 11+"
+  [[ -n $CC_BIN && -x $CC_BIN ]] || die "GCC was not found; load/install GCC 10.3+"
+  [[ -n $CXX_BIN && -x $CXX_BIN ]] || die "G++ was not found; load/install GCC 10.3+"
   [[ -n $CMAKE_BIN && -x $CMAKE_BIN ]] ||
     die "CMake was not found; load/install CMake 3.16+"
 
-  local gcc_major
-  gcc_major=$("$CXX_BIN" -dumpfullversion -dumpversion | cut -d. -f1)
+  local gcc_version gcc_major
+  gcc_version=$("$CXX_BIN" -dumpfullversion -dumpversion)
+  gcc_major=${gcc_version%%.*}
   [[ $gcc_major =~ ^[0-9]+$ ]] || die "unable to determine G++ version"
-  ((gcc_major >= 11)) ||
-    die "G++ 11+ is required; found $("$CXX_BIN" -dumpversion)"
+  version_at_least "$gcc_version" 10 3 ||
+    die "G++ 10.3+ is required; found ${gcc_version}"
+  if ((gcc_major == 10)); then
+    CXX_COMPAT_FLAGS=(-fcoroutines)
+  fi
 
   local cmake_version
   cmake_version=$("$CMAKE_BIN" --version | awk 'NR == 1 {print $3}')
@@ -309,8 +314,23 @@ find_toolchain() {
   "$CXX_BIN" --version | sed -n '1p'
   "$CMAKE_BIN" --version | sed -n '1p'
 
-  if ! printf '#include <coroutine>\nint main() { return 0; }\n' |
-    "$CXX_BIN" -std=c++20 -fopenmp -x c++ -fsyntax-only - \
+  if ! printf '%s\n' \
+    '#include <concepts>' \
+    '#include <coroutine>' \
+    'static_assert(std::convertible_to<int, long>);' \
+    'struct task {' \
+    '  struct promise_type {' \
+    '    task get_return_object() { return {}; }' \
+    '    std::suspend_never initial_suspend() { return {}; }' \
+    '    std::suspend_never final_suspend() noexcept { return {}; }' \
+    '    void return_void() {}' \
+    '    void unhandled_exception() {}' \
+    '  };' \
+    '};' \
+    'task probe() { co_return; }' \
+    'int main() { probe(); }' |
+    "$CXX_BIN" -std=c++20 "${CXX_COMPAT_FLAGS[@]}" -fopenmp \
+      -x c++ -fsyntax-only - \
       >/dev/null 2>&1; then
     die "the selected compiler cannot compile C++20 coroutines with OpenMP"
   fi
@@ -345,6 +365,7 @@ check_headers() {
   for header in "${headers[@]}"; do
     if printf '#include <%s>\n' "$header" |
       "$CXX_BIN" -std=c++20 -fopenmp "${include_arguments[@]}" \
+        "${CXX_COMPAT_FLAGS[@]}" \
         -x c++ -fsyntax-only - \
         >/dev/null 2>&1; then
       printf 'OK      %s\n' "$header"

@@ -1,7 +1,10 @@
 #ifndef COROGRAPH_COROBJ_H
 #define COROGRAPH_COROBJ_H
 
+#include <concepts>
 #include <coroutine>
+#include <exception>
+#include <utility>
 
 template <typename T>
 struct Corobj {

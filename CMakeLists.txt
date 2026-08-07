@@ -2,9 +2,9 @@ cmake_minimum_required(VERSION 3.16)
 project(CoTra LANGUAGES C CXX)
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
-   CMAKE_CXX_COMPILER_VERSION VERSION_LESS 11)
+   CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10.3)
   message(FATAL_ERROR
-    "CoTra requires GCC 11 or newer for C++20 coroutines; found "
+    "CoTra requires GCC 10.3 or newer for C++20 coroutines; found "
     "${CMAKE_CXX_COMPILER_VERSION}")
 endif()
 
@@ -17,6 +17,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# GCC 10 implements C++20 coroutines behind an explicit experimental flag.
+# GCC 11 and newer enable the standard coroutine implementation in C++20 mode.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+   CMAKE_CXX_COMPILER_VERSION VERSION_LESS 11)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fcoroutines>)
+endif()
 
 option(COTRA_NATIVE_ARCH "Optimize for the CPU used to build CoTra" ON)
 set(COTRA_MACHINE_NUM 16 CACHE STRING
