@@ -9,6 +9,8 @@ inline static void asmPause() {
 #if defined(__i386__) || defined(__amd64__)
   //  __builtin_ia32_pause();
   asm volatile("pause");
+#elif defined(__aarch64__) || defined(__arm__)
+  asm volatile("yield");
 #endif
 }
 

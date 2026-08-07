@@ -136,6 +136,7 @@ class RdmaParameter {
   struct memory_ctx *(*memory_create)();
   uint8_t sl;
   uint8_t qp_timeout;
+  int barrier_timeout_seconds;
   int cpu_freq_f;
   cycles_t *tposted;
   cycles_t *tcompleted;

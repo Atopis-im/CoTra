@@ -58,6 +58,20 @@ typedef int FileHandle;
 #define PBSTR "||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||"
 #define PBWIDTH 60
 
+inline std::string diskann_system_error_message(int error)
+{
+    char buffer[1024] = {};
+#ifdef _WINDOWS
+    const int result = strerror_s(buffer, sizeof(buffer), error);
+    return result == 0 ? std::string(buffer) : "error " + std::to_string(error);
+#elif defined(__GLIBC__) && defined(_GNU_SOURCE)
+    return std::string(strerror_r(error, buffer, sizeof(buffer)));
+#else
+    const int result = strerror_r(error, buffer, sizeof(buffer));
+    return result == 0 ? std::string(buffer) : "error " + std::to_string(error);
+#endif
+}
+
 inline bool file_exists_impl(const std::string &name, bool dirCheck = false)
 {
     int val;
@@ -128,13 +142,8 @@ inline void open_file_to_write(std::ofstream &writer, const std::string &filenam
 
     if (writer.fail())
     {
-        char buff[1024];
-#ifdef _WINDOWS
-        auto ret = std::to_string(strerror_s(buff, 1024, errno));
-#else
-        auto ret = std::string(strerror_r(errno, buff, 1024));
-#endif
-        auto message = std::string("Failed to open file") + filename + " for write because " + buff + ", ret=" + ret;
+        auto message = std::string("Failed to open file ") + filename + " for write because " +
+                       diskann_system_error_message(errno);
         diskann::cerr << message << std::endl;
         throw diskann::ANNException(message, -1);
     }
@@ -702,14 +711,8 @@ inline void open_file_to_write(std::ofstream &writer, const std::string &filenam
 
     if (writer.fail())
     {
-        char buff[1024];
-#ifdef _WINDOWS
-        auto ret = std::to_string(strerror_s(buff, 1024, errno));
-#else
-        auto ret = std::string(strerror_r(errno, buff, 1024));
-#endif
-        std::string error_message =
-            std::string("Failed to open file") + filename + " for write because " + buff + ", ret=" + ret;
+        std::string error_message = std::string("Failed to open file ") + filename + " for write because " +
+                                    diskann_system_error_message(errno);
         diskann::cerr << error_message << std::endl;
         throw diskann::ANNException(error_message, -1);
     }

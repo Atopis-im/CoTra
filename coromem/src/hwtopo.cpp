@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -80,6 +81,15 @@ unsigned getNumaNode(cpuinfo &c) {
   return i;
 }
 
+static unsigned readCPUTopologyValue(
+    unsigned cpu, const std::string &name, unsigned fallback) {
+  std::ifstream input(
+      "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/" +
+      name);
+  int value = -1;
+  return input >> value && value >= 0 ? static_cast<unsigned>(value) : fallback;
+}
+
 std::vector<cpuinfo> parseCPUInfo() {
   std::vector<cpuinfo> vals;
 
@@ -102,6 +112,9 @@ std::vector<cpuinfo> parseCPUInfo() {
       cur = num;
       vals.resize(cur + 1);
       vals.at(cur).proc = num;
+      // AArch64 /proc/cpuinfo commonly omits x86 topology fields. Keep every
+      // CPU as a distinct core until sysfs supplies the actual topology.
+      vals.at(cur).coreid = num;
     } else if (sscanf(line.data(), "physical id : %d", &num) == 1) {
       vals.at(cur).physid = num;
     } else if (sscanf(line.data(), "siblings : %d", &num) == 1) {
@@ -113,7 +126,12 @@ std::vector<cpuinfo> parseCPUInfo() {
     }
   }
 
-  for (auto &c : vals) c.numaNode = getNumaNode(c);
+  for (auto &c : vals) {
+    c.physid =
+        readCPUTopologyValue(c.proc, "physical_package_id", c.physid);
+    c.coreid = readCPUTopologyValue(c.proc, "core_id", c.coreid);
+    c.numaNode = getNumaNode(c);
+  }
 
   return vals;
 }

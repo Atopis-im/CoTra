@@ -4,7 +4,7 @@
 #include <limits>
 #include <malloc.h>
 #include <math_utils.h>
-#include <mkl.h>
+#include "diskann_blas.h"
 #include "logger.h"
 #include "utils.h"
 

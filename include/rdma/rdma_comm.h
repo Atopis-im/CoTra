@@ -36,11 +36,12 @@ class RdmaCommunication {
   size_t vector_size;
   size_t correct{0}, total{0}, query_load{0};
   double query_lat_sum{0.0};
+  uint32_t build_sync_round{0};
   // for comp eff profiling.
   size_t all_computation_cnt{0};
 
   RdmaCommunication() {}
-  ~RdmaCommunication() {}
+  ~RdmaCommunication() { delete sc; }
 
   // Indicator for termination.
   bool term[MACHINE_NUM];

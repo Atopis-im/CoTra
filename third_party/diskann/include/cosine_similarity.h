@@ -3,9 +3,6 @@
 
 #pragma once
 
-#include <immintrin.h>
-#include <smmintrin.h>
-#include <tmmintrin.h>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -14,11 +11,15 @@
 #include <algorithm>
 #include <stdexcept>
 
-#include "simd_utils.h"
-
 extern bool Avx2SupportedCPU;
 
 #ifdef _WINDOWS
+#include <immintrin.h>
+#include <smmintrin.h>
+#include <tmmintrin.h>
+
+#include "simd_utils.h"
+
 // SIMD implementation of Cosine similarity. Taken from hnsw library.
 
 /**

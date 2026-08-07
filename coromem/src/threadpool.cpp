@@ -16,6 +16,8 @@ thread_local ThreadPool::thd_signal ThreadPool::thd_info;
 inline static void asmPause() {
 #if defined(__i386__) || defined(__amd64__)
   asm volatile("pause");
+#elif defined(__aarch64__) || defined(__arm__)
+  asm volatile("yield");
 #endif
 }
 
@@ -37,21 +39,30 @@ ThreadPool::ThreadPool()
 }
 
 ThreadPool::~ThreadPool() {
-  destroyCommon();
+  if (!threads.empty()) destroyCommon();
   for (auto &t : threads) {
-    t.join();
+    if (t.joinable()) t.join();
   }
 }
 
 void ThreadPool::poolPause() {
+  if (threads.empty()) return;
   destroyCommon();
   unbindThreadSelf();
   for (auto &t : threads) {
-    t.join();
+    if (t.joinable()) t.join();
+  }
+  threads.clear();
+  for (size_t i = 1; i < signals.size(); ++i) {
+    signals[i] = nullptr;
   }
 }
 
 void ThreadPool::poolContiue() {
+  if (!threads.empty()) return;
+  // destroyCommon() leaves the main thread's completion flag cleared and
+  // poolPause() unbinds it. Reinitialize it before waiting for new workers.
+  initThread(0);
   for (unsigned i = 1; i < mi.maxThreads; ++i) {
     std::thread t(&ThreadPool::threadLoop, this, i);
     threads.emplace_back(std::move(t));

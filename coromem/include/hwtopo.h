@@ -30,14 +30,14 @@ struct HWTopoInfo {
 
 struct cpuinfo {
   // fields filled in from OS files
-  unsigned proc;
-  unsigned physid;
-  unsigned sib;
-  unsigned coreid;
-  unsigned cpucores;
-  unsigned numaNode;  // from libnuma
-  bool valid;         // from cpuset
-  bool smt;           // computed
+  unsigned proc = 0;
+  unsigned physid = 0;
+  unsigned sib = 1;
+  unsigned coreid = 0;
+  unsigned cpucores = 1;
+  unsigned numaNode = 0;  // from libnuma
+  bool valid = false;     // from cpuset
+  bool smt = false;       // computed
 };
 
 /**

@@ -6,10 +6,12 @@
 /* Enable CUDA feature */
 /* #undef CUDA_PATH */
 
-// #define MACHINE_NUM (4)
-// #define MACHINE_NUM (8)
+#ifndef MACHINE_NUM
 #define MACHINE_NUM (16)
-#define MAX_THREAD_NUM (16)
+#endif
+#ifndef MAX_THREAD_NUM
+#define MAX_THREAD_NUM (128)
+#endif
 #define GROUP_SIZE (16)
 // NOTE: MAX_READ_NUM is the max read num one thread cand send to one machine
 #define MAX_READ_NUM (2 * GROUP_SIZE)
@@ -41,6 +43,7 @@
 #define DEF_INLINE (0)
 #define MIN_RNR_TIMER (12)
 #define DEF_QP_TIME (14)
+#define DEF_BARRIER_TIMEOUT (1800)
 #define DEF_CQ_MOD (100)
 #define MSG_SIZE_CQ_MOD_LIMIT (8192)
 #define DISABLED_CQ_MOD_VALUE (1)

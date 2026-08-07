@@ -35,6 +35,17 @@ resolve_hostname() {
   return 0
 }
 
+is_local_ipv4() {
+  local expected_ip=$1
+  if command -v ip &> /dev/null; then
+    ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' |
+      cut -d/ -f1 | grep -Fqx -- "$expected_ip"
+    return $?
+  fi
+
+  [[ "$(resolve_hostname "$(hostname)")" == "$expected_ip" ]]
+}
+
 
 clear_memcache() {
   local CONF_FILE=$1
@@ -51,36 +62,51 @@ clear_memcache() {
     echo "leader hostname $leader_hostname ip: $read_ip"
   else
     echo "failed to resolve leader machine ip"
+    return 1
   fi
 
   hostname=$(hostname)
-  local_ip=$(resolve_hostname "$hostname")
-  echo "local hostname: $hostname ip: $local_ip"
+  echo "local hostname: $hostname"
 
-  if [[ "$read_ip" == "$local_ip" ]]; then
+  if is_local_ipv4 "$read_ip"; then
+    if ! command -v memcached &> /dev/null; then
+      echo "memcached is not installed on the leader"
+      return 1
+    fi
+    if ! command -v nc &> /dev/null; then
+      echo "nc is required to initialize CoTra metadata"
+      return 1
+    fi
+
     # restart memcache
     addr=$DOMAIN
     port=$PORT
+    pid_file="${TMPDIR:-/tmp}/cotra-memcached-${UID}.pid"
 
     # kill old me
-    if [[ -f /tmp/memcached.pid ]]; then
-        kill "$(cat /tmp/memcached.pid)" 2>/dev/null
-        rm -f /tmp/memcached.pid
+    if [[ -f "$pid_file" ]]; then
+        kill "$(cat "$pid_file")" 2>/dev/null
+        rm -f "$pid_file"
     fi
 
     # launch memcached
-    memcached -u root -l ${addr} -p  ${port} -c 10000 -d -P /tmp/memcached.pid
+    memcached_args=(-l "$addr" -p "$port" -c 10000 -d -P "$pid_file")
+    if [[ $EUID -eq 0 ]]; then
+      memcached_args=(-u root "${memcached_args[@]}")
+    fi
+    if ! memcached "${memcached_args[@]}"; then
+      echo "failed to start memcached on $addr:$port"
+      return 1
+    fi
     sleep 1
 
-    # init 
-    echo -e "set serverNum 0 0 1\r\n0\r\nquit\r" | nc ${addr} ${port}
-    echo -e "set clientNum 0 0 1\r\n0\r\nquit\r" | nc ${addr} ${port}
+    # Clear stale metadata from earlier runs and initialize counters.
+    printf 'flush_all\r\nquit\r\n' | nc "$addr" "$port"
+    printf 'set serverNum 0 0 1\r\n0\r\nquit\r\n' | nc "$addr" "$port"
+    printf 'set clientNum 0 0 1\r\n0\r\nquit\r\n' | nc "$addr" "$port"
     echo "memcache clear and restart"
   fi
-  return 1
+  return 0
 }
-
-
-
 
 

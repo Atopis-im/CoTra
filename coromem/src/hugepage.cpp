@@ -2,7 +2,10 @@
 
 #include <sys/mman.h>
 
+#include <cstdio>
+#include <fstream>
 #include <mutex>
+#include <string>
 
 #include "runtime/mem.h"
 #include "substrate/simple_lock.h"
@@ -38,16 +41,41 @@ static const int _MAP_HUGE_POP = _MAP_POP;
 static const int _MAP_HUGE = _MAP;
 #endif
 
+static bool compatibleHugePageSize() {
+#ifdef MAP_HUGETLB
+  static const bool compatible = []() {
+    std::ifstream meminfo("/proc/meminfo");
+    std::string line;
+    while (std::getline(meminfo, line)) {
+      size_t sizeKB = 0;
+      if (sscanf(line.c_str(), "Hugepagesize: %zu kB", &sizeKB) == 1) {
+        return sizeKB * 1024 == hugePageSize;
+      }
+    }
+    return false;
+  }();
+  return compatible;
+#else
+  return false;
+#endif
+}
+
 size_t allocSize() { return hugePageSize; }
 
 void *allocPages(unsigned num, bool preFault) {
   if (num > 0) {
-    void *ptr =
-        trymmap(num * hugePageSize, preFault ? _MAP_HUGE_POP : _MAP_HUGE);
+    void *ptr = nullptr;
+    if (compatibleHugePageSize()) {
+      ptr = trymmap(
+          num * hugePageSize, preFault ? _MAP_HUGE_POP : _MAP_HUGE);
+    }
     if (!ptr) {
-      printf(
-          "WARN: Failed to allocate huge pages. Falling back to normal "
-          "pages.\n");
+      static std::once_flag warning;
+      std::call_once(warning, []() {
+        printf(
+            "WARN: Compatible 2 MiB huge pages are unavailable. Falling "
+            "back to normal pages.\n");
+      });
       ptr = trymmap(num * hugePageSize, preFault ? _MAP_POP : _MAP);
     }
 

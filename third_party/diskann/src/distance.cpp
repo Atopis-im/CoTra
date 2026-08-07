@@ -1,16 +1,18 @@
 // TODO
 // CHECK COSINE ON LINUX
 
-#ifdef _WINDOWS
+#if defined(_WINDOWS)
 #include <immintrin.h>
 #include <smmintrin.h>
 #include <tmmintrin.h>
 #include <intrin.h>
-#else
+#elif defined(__i386__) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
 
+#if defined(_WINDOWS) || defined(__i386__) || defined(__x86_64__)
 #include "simd_utils.h"
+#endif
 #include <cosine_similarity.h>
 #include <iostream>
 
@@ -386,8 +388,8 @@ template <typename T> float DistanceInnerProduct<T>::inner_product(const T *a, c
 #else
 
     float dot0, dot1, dot2, dot3;
-    const float *last = a + size;
-    const float *unroll_group = last - 3;
+    const T *last = a + size;
+    const T *unroll_group = last - 3;
 
     /* Process 4 items with each loop for efficiency. */
     while (a < unroll_group)
@@ -494,8 +496,8 @@ template <typename T> float DistanceFastL2<T>::norm(const T *a, uint32_t size) c
     result += unpack[0] + unpack[1] + unpack[2] + unpack[3];
 #else
     float dot0, dot1, dot2, dot3;
-    const float *last = a + size;
-    const float *unroll_group = last - 3;
+    const T *last = a + size;
+    const T *unroll_group = last - 3;
 
     /* Process 4 items with each loop for efficiency. */
     while (a < unroll_group)
@@ -521,6 +523,7 @@ template <typename T> float DistanceFastL2<T>::norm(const T *a, uint32_t size) c
 
 float AVXDistanceInnerProductFloat::compare(const float *a, const float *b, uint32_t size) const
 {
+#if defined(__AVX__) || defined(_WINDOWS)
     float result = 0.0f;
 #define AVX_DOT(addr1, addr2, dest, tmp1, tmp2)                                                                        \
     tmp1 = _mm256_loadu_ps(addr1);                                                                                     \
@@ -559,6 +562,15 @@ float AVXDistanceInnerProductFloat::compare(const float *a, const float *b, uint
     result = unpack[0] + unpack[1] + unpack[2] + unpack[3] + unpack[4] + unpack[5] + unpack[6] + unpack[7];
 
     return -result;
+#else
+    float result = 0.0f;
+#pragma omp simd reduction(+ : result)
+    for (uint32_t i = 0; i < size; ++i)
+    {
+        result += a[i] * b[i];
+    }
+    return -result;
+#endif
 }
 
 uint32_t AVXNormalizedCosineDistanceFloat::post_normalization_dimension(uint32_t orig_dimension) const
@@ -623,10 +635,15 @@ template <> diskann::Distance<float> *get_distance_function(diskann::Metric m)
     }
     else if (m == diskann::Metric::INNER_PRODUCT)
     {
+#if defined(__AVX__) || defined(_WINDOWS)
         diskann::cout << "Inner product: Using AVX2 implementation "
                          "AVXDistanceInnerProductFloat"
                       << std::endl;
         return new diskann::AVXDistanceInnerProductFloat();
+#else
+        diskann::cout << "Inner product: Using portable implementation" << std::endl;
+        return new diskann::DistanceInnerProduct<float>();
+#endif
     }
     else if (m == diskann::Metric::FAST_L2)
     {
