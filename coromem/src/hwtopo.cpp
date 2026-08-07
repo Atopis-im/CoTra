@@ -313,19 +313,23 @@ bool unbindThreadSelf() {
   /* CPU_ZERO initializes all the bits in the mask to zero. */
   CPU_ZERO(&mask);
 
-  /* Get the number of processors available. */
-  int numCPUs = sysconf(_SC_NPROCESSORS_ONLN);
-  if (numCPUs <= 0) {
-    printf(
-        "Failed to get the number of available processors (%s)",
-        strerror(errno));
+  /* Restore the CPU set that was available when the topology was read. */
+  const auto topology = getHWTopo();
+  if (topology.threadTopoInfo.empty()) {
+    printf("Failed to restore CPU affinity: no available CPUs\n");
     return false;
   }
 
-  /* CPU_SET all available CPUs in the mask. */
-  std::cout << "reset CPU num:" << numCPUs << std::endl;
-  for (int i = 0; i < numCPUs; ++i) {
-    (void)CPU_SET(i, &mask);
+  std::cout << "reset CPU num:" << topology.threadTopoInfo.size()
+            << std::endl;
+  for (const auto &thread : topology.threadTopoInfo) {
+    if (thread.osContext >= CPU_SETSIZE) {
+      printf(
+          "Failed to restore CPU affinity: CPU %u exceeds CPU_SETSIZE\n",
+          thread.osContext);
+      return false;
+    }
+    (void)CPU_SET(thread.osContext, &mask);
   }
 
   /* sched_setaffinity returns 0 on success */

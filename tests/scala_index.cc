@@ -3,6 +3,7 @@
 
 #include <boost/program_options.hpp>
 
+#include "coromem/include/hwtopo.h"
 #include "coromem/include/share_mem.h"
 #include "coromem/include/utils.h"
 #include "index/scala_build.h"
@@ -27,6 +28,16 @@ int main(int argc, char **argv) {
   
   // Build local partition index.
   scala_build.swap_partition_info();
+
+  // ThreadPool pins the main thread to its first CPU during construction.
+  // Release only the main thread here, after the RDMA setup and partition
+  // exchange have completed, so OpenMP workers inherit the full CPU set.
+  // Keep the ThreadPool workers alive because RDMA still uses them.
+  if (!unbindThreadSelf()) {
+    std::cerr << "Failed to release main-thread CPU affinity before index "
+                 "build.\n";
+    return 1;
+  }
 
   scala_build.build();
 
