@@ -1,5 +1,6 @@
 #include "rdma/rdma_param.h"
 
+#include "coromem/include/threadpool.h"
 #include "rdma/ip_config.h"
 
 RdmaParameter::RdmaParameter() {
