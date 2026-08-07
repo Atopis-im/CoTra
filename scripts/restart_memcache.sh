@@ -90,7 +90,19 @@ clear_memcache() {
     fi
 
     # launch memcached
-    memcached_args=(-l "$addr" -p "$port" -c 10000 -d -P "$pid_file")
+    local max_connections ready memcached_pid
+    max_connections="${COTRA_MEMCACHED_MAX_CONNECTIONS:-256}"
+    if [[ ! $max_connections =~ ^[1-9][0-9]*$ ]]; then
+      echo "COTRA_MEMCACHED_MAX_CONNECTIONS must be a positive integer"
+      return 1
+    fi
+    memcached_args=(
+      -l "$addr"
+      -p "$port"
+      -c "$max_connections"
+      -d
+      -P "$pid_file"
+    )
     if [[ $EUID -eq 0 ]]; then
       memcached_args=(-u root "${memcached_args[@]}")
     fi
@@ -98,15 +110,36 @@ clear_memcache() {
       echo "failed to start memcached on $addr:$port"
       return 1
     fi
-    sleep 1
+
+    ready=0
+    for _ in {1..10}; do
+      if printf 'version\r\nquit\r\n' |
+        nc -w 1 "$addr" "$port" >/dev/null 2>&1; then
+        ready=1
+        break
+      fi
+      if [[ -s $pid_file ]]; then
+        memcached_pid=$(cat "$pid_file" 2>/dev/null || true)
+        if [[ -n $memcached_pid ]] && ! kill -0 "$memcached_pid" 2>/dev/null; then
+          break
+        fi
+      fi
+      sleep 1
+    done
+    if [[ $ready -ne 1 ]]; then
+      echo "memcached did not become ready on $addr:$port"
+      echo "open-file limit: $(ulimit -n)"
+      echo "diagnose with: memcached -vv -l $addr -p $port -c $max_connections"
+      return 1
+    fi
 
     # Clear stale metadata from earlier runs and initialize counters.
-    printf 'flush_all\r\nquit\r\n' | nc "$addr" "$port"
-    printf 'set serverNum 0 0 1\r\n0\r\nquit\r\n' | nc "$addr" "$port"
-    printf 'set clientNum 0 0 1\r\n0\r\nquit\r\n' | nc "$addr" "$port"
+    printf 'flush_all\r\nquit\r\n' | nc -w 2 "$addr" "$port"
+    printf 'set serverNum 0 0 1\r\n0\r\nquit\r\n' |
+      nc -w 2 "$addr" "$port"
+    printf 'set clientNum 0 0 1\r\n0\r\nquit\r\n' |
+      nc -w 2 "$addr" "$port"
     echo "memcache clear and restart"
   fi
   return 0
 }
-
-
