@@ -171,14 +171,19 @@ the two-node configuration, builds CoTra, and runs indexing or search. It uses
 the reported node 0 defaults `71.54.52.21` (memcached) and `33.40.10.121`
 (RoCE). Supply node 1's RoCE address on both hosts:
 
+See the complete Chinese runbook, including the exact server paths, shared
+build workflow, thread settings, launch order, validation, and troubleshooting:
+[Kunpeng ARM/RoCE two-node runbook](docs/ARM_ROCE_2NODE_RUNBOOK.md).
+
 ```bash
 export NODE1_RDMA_IP=<node-1-33.40.x.x-address>
 
 # Run on both nodes. Rerun check after both have written the shared-path marker.
 bash scripts/arm_roce_2node.sh check
 
-# Build separately on both nodes; per-host build directories avoid collisions.
-bash scripts/arm_roce_2node.sh build
+# If the source and build directory are shared, build once on node 0. Otherwise
+# use a separate build directory on each node.
+bash scripts/arm_roce_2node.sh build --build-dir <shared-or-local-build-dir>
 
 # Start on node 0 first, then node 1; wait for both commands to exit.
 bash scripts/arm_roce_2node.sh index
