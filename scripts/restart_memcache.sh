@@ -46,6 +46,29 @@ is_local_ipv4() {
   [[ "$(resolve_hostname "$(hostname)")" == "$expected_ip" ]]
 }
 
+probe_memcached() {
+  local addr=$1
+  local port=$2
+
+  printf 'version\r\nquit\r\n' |
+    nc -w 1 "$addr" "$port" >/dev/null 2>&1
+}
+
+wait_for_memcached() {
+  local addr=$1
+  local port=$2
+  local attempts=$3
+  local attempt
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if probe_memcached "$addr" "$port"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 
 clear_memcache() {
   local CONF_FILE=$1
@@ -83,10 +106,32 @@ clear_memcache() {
     port=$PORT
     pid_file="${TMPDIR:-/tmp}/cotra-memcached-${UID}.pid"
 
-    # kill old me
-    if [[ -f "$pid_file" ]]; then
-        kill "$(cat "$pid_file")" 2>/dev/null
-        rm -f "$pid_file"
+    # Stop the previous daemon completely before reusing its listening port.
+    # Without this wait, a probe can connect to the dying old process and then
+    # the C++ client sees ECONNREFUSED after that process exits.
+    local old_pid old_comm
+    if [[ -s $pid_file ]]; then
+      old_pid=$(cat "$pid_file" 2>/dev/null || true)
+      if [[ $old_pid =~ ^[1-9][0-9]*$ ]] && kill -0 "$old_pid" 2>/dev/null; then
+        old_comm=$(ps -p "$old_pid" -o comm= 2>/dev/null || true)
+        old_comm=${old_comm//[[:space:]]/}
+        if [[ $old_comm != memcached ]]; then
+          echo "refusing to stop PID $old_pid from $pid_file: process is $old_comm"
+          return 1
+        fi
+        kill "$old_pid" 2>/dev/null || true
+        for _ in {1..50}; do
+          if ! kill -0 "$old_pid" 2>/dev/null; then
+            break
+          fi
+          sleep 0.1
+        done
+        if kill -0 "$old_pid" 2>/dev/null; then
+          echo "old memcached PID $old_pid did not stop within 5 seconds"
+          return 1
+        fi
+      fi
+      rm -f "$pid_file"
     fi
 
     # launch memcached
@@ -112,21 +157,12 @@ clear_memcache() {
     fi
 
     ready=0
-    for _ in {1..10}; do
-      if printf 'version\r\nquit\r\n' |
-        nc -w 1 "$addr" "$port" >/dev/null 2>&1; then
-        ready=1
-        break
-      fi
-      if [[ -s $pid_file ]]; then
-        memcached_pid=$(cat "$pid_file" 2>/dev/null || true)
-        if [[ -n $memcached_pid ]] && ! kill -0 "$memcached_pid" 2>/dev/null; then
-          break
-        fi
-      fi
-      sleep 1
-    done
-    if [[ $ready -ne 1 ]]; then
+    if wait_for_memcached "$addr" "$port" 10; then
+      ready=1
+    fi
+    memcached_pid=$(cat "$pid_file" 2>/dev/null || true)
+    if [[ $ready -ne 1 || ! $memcached_pid =~ ^[1-9][0-9]*$ ]] ||
+      ! kill -0 "$memcached_pid" 2>/dev/null; then
       echo "memcached did not become ready on $addr:$port"
       echo "open-file limit: $(ulimit -n)"
       echo "diagnose with: memcached -vv -l $addr -p $port -c $max_connections"
@@ -140,6 +176,18 @@ clear_memcache() {
     printf 'set clientNum 0 0 1\r\n0\r\nquit\r\n' |
       nc -w 2 "$addr" "$port"
     echo "memcache clear and restart"
+  else
+    if ! command -v nc &> /dev/null; then
+      echo "nc is required to verify the leader metadata service"
+      return 1
+    fi
+    echo "waiting for leader memcached at $read_ip:$PORT"
+    if ! wait_for_memcached "$read_ip" "$PORT" 30; then
+      echo "cannot reach leader memcached at $read_ip:$PORT after 30 seconds"
+      echo "check on the leader: ss -ltnp | grep ':$PORT'"
+      return 1
+    fi
+    echo "leader memcached is reachable at $read_ip:$PORT"
   fi
   return 0
 }
