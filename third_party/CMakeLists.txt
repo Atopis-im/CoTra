@@ -8,8 +8,18 @@ find_package(LAPACK REQUIRED)
 
 find_path(CBLAS_INCLUDE_DIR
   NAMES cblas.h
-  PATH_SUFFIXES openblas aarch64-linux-gnu x86_64-linux-gnu)
-find_path(LAPACKE_INCLUDE_DIR NAMES lapacke.h)
+  PATH_SUFFIXES
+    openblas
+    openblas-pthread
+    aarch64-linux-gnu
+    x86_64-linux-gnu)
+find_path(LAPACKE_INCLUDE_DIR
+  NAMES lapacke.h
+  PATH_SUFFIXES
+    openblas
+    openblas-pthread
+    aarch64-linux-gnu
+    x86_64-linux-gnu)
 find_library(LAPACKE_LIBRARY NAMES lapacke)
 find_path(AIO_INCLUDE_DIR NAMES libaio.h)
 find_library(AIO_LIBRARY NAMES aio)
