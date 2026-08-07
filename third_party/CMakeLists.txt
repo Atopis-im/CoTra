@@ -20,18 +20,39 @@ find_path(LAPACKE_INCLUDE_DIR
     openblas-pthread
     aarch64-linux-gnu
     x86_64-linux-gnu)
-find_library(LAPACKE_LIBRARY NAMES lapacke)
+find_library(LAPACKE_LIBRARY
+  NAMES lapacke
+  PATH_SUFFIXES openblas openblas-pthread)
 find_path(AIO_INCLUDE_DIR NAMES libaio.h)
 find_library(AIO_LIBRARY NAMES aio)
 find_library(CBLAS_LIBRARY NAMES openblas cblas)
 
 foreach(required_var IN ITEMS
-    CBLAS_INCLUDE_DIR LAPACKE_INCLUDE_DIR LAPACKE_LIBRARY
+    CBLAS_INCLUDE_DIR LAPACKE_INCLUDE_DIR
     AIO_INCLUDE_DIR AIO_LIBRARY)
   if(NOT ${required_var})
     message(FATAL_ERROR "Required DiskANN dependency was not found: ${required_var}")
   endif()
 endforeach()
+
+# Some OpenBLAS packages export LAPACKE from libopenblas instead of installing
+# a separate liblapacke. Verify the exact DiskANN symbol before accepting that
+# layout so a missing LAPACKE implementation still fails during configuration.
+set(COTRA_LAPACKE_LIBRARIES)
+if(LAPACKE_LIBRARY)
+  list(APPEND COTRA_LAPACKE_LIBRARIES "${LAPACKE_LIBRARY}")
+else()
+  include(CheckFunctionExists)
+  set(_COTRA_SAVED_REQUIRED_LIBRARIES "${CMAKE_REQUIRED_LIBRARIES}")
+  set(CMAKE_REQUIRED_LIBRARIES ${LAPACK_LIBRARIES} ${BLAS_LIBRARIES})
+  check_function_exists(LAPACKE_sgesdd COTRA_LAPACKE_IN_LAPACK)
+  set(CMAKE_REQUIRED_LIBRARIES "${_COTRA_SAVED_REQUIRED_LIBRARIES}")
+  unset(_COTRA_SAVED_REQUIRED_LIBRARIES)
+  if(NOT COTRA_LAPACKE_IN_LAPACK)
+    message(FATAL_ERROR
+      "LAPACKE_sgesdd was not found in liblapacke, LAPACK, or BLAS")
+  endif()
+endif()
 
 file(GLOB DISKANN_SOURCES CONFIGURE_DEPENDS
   "${DISKANN_SOURCE_DIR}/src/*.cpp")
@@ -49,9 +70,9 @@ target_link_libraries(diskann
     Threads::Threads
     OpenMP::OpenMP_CXX
     Boost::program_options
-    ${BLAS_LIBRARIES}
+    ${COTRA_LAPACKE_LIBRARIES}
     ${LAPACK_LIBRARIES}
-    ${LAPACKE_LIBRARY}
+    ${BLAS_LIBRARIES}
     ${AIO_LIBRARY})
 
 if(CBLAS_LIBRARY)
