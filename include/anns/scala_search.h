@@ -2308,9 +2308,15 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
             global_query[query_id]->candidate_set.emplace(cand);
           }
         } else {
+          printf("[DBG-FORK] q%u fork to m%u from m%u\n", query_id, m, (unsigned)rdma_param.machine_id);
           rdma_comm.fork_query(m, global_query[query_id]);
         }
       }
+      printf("[DBG-DISPATCH] q%u core_machines=%zu local_is_core=%d leader=%u origin=%u\n",
+             query_id, global_query[query_id]->core_machine.size(),
+             (int)local_is_core,
+             global_query[query_id]->leader_machine,
+             global_query[query_id]->origin_machine);
       global_query[query_id]->visit_hash.clear();
 
       // Send core machine info to leader machine scheduler.
@@ -2433,9 +2439,20 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
 #endif
           } else {
             all_result_recved = (recv_cnt == post_cnt) && (nocore_post == nocore_recv);
-            // printf(
-            //     "q%d post_cnt %d recv_cnt %d\n", query_id, post_cnt,
-            //     recv_cnt);
+            // [DEBUG] Periodic log for post/recv counter mismatch
+            {
+              static int _dbg_yield_cnt = 0;
+              _dbg_yield_cnt++;
+              if (_dbg_yield_cnt % 100 == 0) {
+                printf("[DBG-CORO] q%u state=%d post=%u recv=%u npost=%u nrecv=%u cand=%zu top=%zu core_m=%zu leader=%u\n",
+                       query_id, (int)global_query[query_id]->state,
+                       post_cnt, recv_cnt, nocore_post, nocore_recv,
+                       global_query[query_id]->candidate_set.size(),
+                       global_query[query_id]->top_candidates.size(),
+                       global_query[query_id]->core_machine.size(),
+                       global_query[query_id]->leader_machine);
+              }
+            }
 
 #ifdef PROFILER
             m_profiler.end("post_task");
@@ -3182,6 +3199,20 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
 #endif
       // printf("tman.cur_query_num %u\n", tman.cur_query_num);
 
+      // [DEBUG] Periodic state dump for search loop
+      {
+        static thread_local uint64_t _dbg_loop_cnt = 0;
+        _dbg_loop_cnt++;
+        if (_dbg_loop_cnt % 500000 == 1) {
+          printf("[DBG-SEARCH][T%u] qid=%u cur_qnum=%u task=%zu res=%zu query=%zu async=%zu sub=%zu node=%zu cand=%zu state=%d\n",
+                 (unsigned)ThreadPool::getTID(), qid, tman.cur_query_num,
+                 task_queue.size(), result_queue.size(), query_queue.size(),
+                 async_queue.size(), subquery_queue.size(), node_queue.size(),
+                 global_query[qid] ? global_query[qid]->candidate_set.size() : 0,
+                 global_query[qid] ? (int)global_query[qid]->state : -1);
+        }
+      }
+
       if (!task_queue.size() && !result_queue.size() && !query_queue.size() &&
           !async_queue.size() && !subquery_queue.size() && !node_queue.size()) {
         if (tman.cur_query_num < QUERY_GROUP_SIZE) {
@@ -3219,6 +3250,18 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
 #else
     rdma_comm.poll_task_result(tman);
 #endif
+
+    // [DEBUG] Periodic log for wait_finish
+    {
+      static thread_local uint64_t _dbg_wf_cnt = 0;
+      _dbg_wf_cnt++;
+      if (_dbg_wf_cnt % 500000 == 1) {
+        printf("[DBG-WAIT][T%u] qnum=%u task=%zu res=%zu query=%zu async=%zu sub=%zu node=%zu\n",
+               (unsigned)ThreadPool::getTID(), tman.cur_query_num,
+               task_queue.size(), result_queue.size(), query_queue.size(),
+               async_queue.size(), subquery_queue.size(), node_queue.size());
+      }
+    }
 
     if (query_queue.size() || result_queue.size() || task_queue.size() ||
         async_queue.size() || subquery_queue.size() || node_queue.size()) {
