@@ -66,8 +66,16 @@ bool Avx2SupportedCPU = cpuHasAvx2Support();
 
 #else
 
+#if defined(__AVX2__)
 bool Avx2SupportedCPU = true;
+bool AvxSupportedCPU = true;
+#elif defined(__AVX__)
+bool Avx2SupportedCPU = false;
+bool AvxSupportedCPU = true;
+#else
+bool Avx2SupportedCPU = false;
 bool AvxSupportedCPU = false;
+#endif
 #endif
 
 namespace diskann

@@ -1,176 +1,104 @@
-# Copyright (c) Microsoft Corporation. All rights reserved.
-# Licensed under the MIT license.
+set(DISKANN_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/diskann")
 
-# Parameters:
-#
-# BOOST_ROOT:
-#   Specify root of the Boost library if Boost cannot be auto-detected. On Windows, a fallback to a
-#   downloaded nuget version will be used if Boost cannot be found.
-#
-# DISKANN_RELEASE_UNUSED_TCMALLOC_MEMORY_AT_CHECKPOINTS:
-#   This is a work-in-progress feature, not completed yet. The core DiskANN library will be split into
-#   build-related and search-related functionality. In build-related functionality, when using tcmalloc,
-#   it's possible to release memory that's free but reserved by tcmalloc. Setting this to true enables
-#   such behavior.
-#   Contact for this feature: gopalrs.
+find_package(Threads REQUIRED)
+find_package(OpenMP REQUIRED)
+find_package(Boost REQUIRED COMPONENTS program_options)
+find_package(BLAS REQUIRED)
+find_package(LAPACK REQUIRED)
 
+find_path(CBLAS_INCLUDE_DIR
+  NAMES cblas.h
+  PATH_SUFFIXES
+    openblas
+    openblas-pthread
+    aarch64-linux-gnu
+    x86_64-linux-gnu)
+find_path(LAPACKE_INCLUDE_DIR
+  NAMES lapacke.h
+  PATH_SUFFIXES
+    openblas
+    openblas-pthread
+    aarch64-linux-gnu
+    x86_64-linux-gnu)
+find_library(LAPACKE_LIBRARY
+  NAMES lapacke
+  PATH_SUFFIXES openblas openblas-pthread)
+find_path(AIO_INCLUDE_DIR NAMES libaio.h)
+find_library(AIO_LIBRARY NAMES aio)
+find_library(CBLAS_LIBRARY NAMES openblas cblas)
 
-# Some variables like MSVC are defined only after project(), so put that first.
-# cmake_minimum_required(VERSION 3.15)
-# project(diskann)
-
-set(PROJECT_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/diskann")
-set(CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake;${CMAKE_MODULE_PATH}")
-
-
-include_directories(${PROJECT_SOURCE_DIR}/include)
-
-if(NOT PYBIND)
-set(DISKANN_RELEASE_UNUSED_TCMALLOC_MEMORY_AT_CHECKPOINTS ON)
-endif()
-# It's necessary to include tcmalloc headers only if calling into MallocExtension interface.
-# For using tcmalloc in DiskANN tools, it's enough to just link with tcmalloc.
-if (DISKANN_RELEASE_UNUSED_TCMALLOC_MEMORY_AT_CHECKPOINTS)
-include_directories(${PROJECT_SOURCE_DIR}/gperftools/src)
-endif()
-
-include_directories(/usr/local/include)
-include_directories(./3rdparty/faiss)
-link_libraries(/data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/faiss-1.7.4-7lwxh7hvrens6htzefdgvibwohkv7pdh/lib/libfaiss.a)
-
-#OpenMP
-# find_package(OpenMP)
-
-# if (OPENMP_FOUND)
-#     set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
-#     set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
-# else()
-# message(FATAL_ERROR "No OpenMP support")
-# endif()
-    
-# DiskANN core uses header-only libraries. Only DiskANN tools need program_options which has a linker library,
-# but its size is small. Reduce number of dependent DLLs by linking statically.
-if(NOT MSVC)
-find_package(Boost COMPONENTS program_options)
-endif()
-
-if (NOT Boost_FOUND)
-    message(FATAL_ERROR "Couldn't find Boost dependency")
-endif()
-
-include_directories(${Boost_INCLUDE_DIR})
-set(POSSIBLE_OMP_PATHS "/data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/intel-oneapi-mkl-2024.0.0-a4e6uj4nsyq4llk43fbax6eobust7uug/compiler/latest/lib/libiomp5.so")
-    
-foreach(POSSIBLE_OMP_PATH ${POSSIBLE_OMP_PATHS})
-    if (EXISTS ${POSSIBLE_OMP_PATH})
-        get_filename_component(OMP_PATH ${POSSIBLE_OMP_PATH} DIRECTORY)
-    endif()
+foreach(required_var IN ITEMS
+    CBLAS_INCLUDE_DIR LAPACKE_INCLUDE_DIR
+    AIO_INCLUDE_DIR AIO_LIBRARY)
+  if(NOT ${required_var})
+    message(FATAL_ERROR "Required DiskANN dependency was not found: ${required_var}")
+  endif()
 endforeach()
 
-if(NOT OMP_PATH)
-    message(FATAL_ERROR "Could not find Intel OMP in standard locations; use -DOMP_PATH to specify the install location for your environment")
-endif()
-link_directories(${OMP_PATH})
-
-set(POSSIBLE_MKL_LIB_PATHS "/data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/intel-oneapi-mkl-2024.0.0-a4e6uj4nsyq4llk43fbax6eobust7uug/mkl/latest/lib/intel64/libmkl_core.so")
-
-foreach(POSSIBLE_MKL_LIB_PATH ${POSSIBLE_MKL_LIB_PATHS})
-    if (EXISTS ${POSSIBLE_MKL_LIB_PATH})
-        get_filename_component(MKL_PATH ${POSSIBLE_MKL_LIB_PATH} DIRECTORY)
-    endif()
-endforeach()
-
-set(POSSIBLE_MKL_INCLUDE_PATHS "/data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/intel-oneapi-mkl-2024.0.0-a4e6uj4nsyq4llk43fbax6eobust7uug/mkl/latest/include")
-
-foreach(POSSIBLE_MKL_INCLUDE_PATH ${POSSIBLE_MKL_INCLUDE_PATHS})
-    if (EXISTS ${POSSIBLE_MKL_INCLUDE_PATH})
-        set(MKL_INCLUDE_PATH ${POSSIBLE_MKL_INCLUDE_PATH})
-    endif()
-endforeach()
-if(NOT MKL_PATH)
-    message(FATAL_ERROR "Could not find Intel MKL in standard locations; use -DMKL_PATH to specify the install location for your environment")
-elseif(NOT MKL_INCLUDE_PATH)
-    message(FATAL_ERROR "Could not find Intel MKL in standard locations; use -DMKL_INCLUDE_PATH to specify the install location for headers for your environment")
-endif()
-if (EXISTS ${MKL_PATH}/libmkl_def.so.2)
-    set(MKL_DEF_SO ${MKL_PATH}/libmkl_def.so.2)
-elseif(EXISTS ${MKL_PATH}/libmkl_def.so)
-    set(MKL_DEF_SO ${MKL_PATH}/libmkl_def.so)
+# Some OpenBLAS packages export LAPACKE from libopenblas instead of installing
+# a separate liblapacke. Verify the exact DiskANN symbol before accepting that
+# layout so a missing LAPACKE implementation still fails during configuration.
+set(COTRA_LAPACKE_LIBRARIES)
+if(LAPACKE_LIBRARY)
+  list(APPEND COTRA_LAPACKE_LIBRARIES "${LAPACKE_LIBRARY}")
 else()
-    message(FATAL_ERROR "Despite finding MKL, libmkl_def.so was not found in expected locations.")
-endif()
-link_directories(${MKL_PATH})
-include_directories(${MKL_INCLUDE_PATH})
-
-# compile flags and link libraries
-add_compile_options(-m64 -Wl,--no-as-needed)
-if (NOT PYBIND)
-    link_libraries(mkl_intel_ilp64 mkl_intel_thread mkl_core iomp5 pthread m dl)
-else()
-    # static linking for python so as to minimize customer dependency issues
-    link_libraries(
-            ${MKL_PATH}/libmkl_intel_ilp64.a
-            ${MKL_PATH}/libmkl_intel_thread.a
-            ${MKL_PATH}/libmkl_core.a
-            ${MKL_DEF_SO}
-            iomp5
-            pthread
-            m
-            dl
-    )
+  include(CheckFunctionExists)
+  set(_COTRA_SAVED_REQUIRED_LIBRARIES "${CMAKE_REQUIRED_LIBRARIES}")
+  set(CMAKE_REQUIRED_LIBRARIES ${LAPACK_LIBRARIES} ${BLAS_LIBRARIES})
+  check_function_exists(LAPACKE_sgesdd COTRA_LAPACKE_IN_LAPACK)
+  set(CMAKE_REQUIRED_LIBRARIES "${_COTRA_SAVED_REQUIRED_LIBRARIES}")
+  unset(_COTRA_SAVED_REQUIRED_LIBRARIES)
+  if(NOT COTRA_LAPACKE_IN_LAPACK)
+    message(FATAL_ERROR
+      "LAPACKE_sgesdd was not found in liblapacke, LAPACK, or BLAS")
+  endif()
 endif()
 
-# find_package(MKL)
+file(GLOB DISKANN_SOURCES CONFIGURE_DEPENDS
+  "${DISKANN_SOURCE_DIR}/src/*.cpp")
 
-# if(MKL_FOUND)
-#     message(STATUS "MKL found, MKL Include dirs: ${MKL_INCLUDE_DIRS}, MKL Libraries: ${MKL_LIBRARIES}")
-#     include_directories(/usr/include/mkl)
-#     link_libraries(${MKL_LIBRARIES})
-# else()
-#     message(FATAL_ERROR "No MKL support")
-# endif()
+add_library(diskann STATIC ${DISKANN_SOURCES})
+target_include_directories(diskann
+  PUBLIC
+    "${DISKANN_SOURCE_DIR}/include"
+    "${CBLAS_INCLUDE_DIR}"
+    "${LAPACKE_INCLUDE_DIR}"
+    "${AIO_INCLUDE_DIR}")
 
-add_definitions(-DMKL_ILP64)
+target_link_libraries(diskann
+  PUBLIC
+    Threads::Threads
+    OpenMP::OpenMP_CXX
+    Boost::program_options
+    ${COTRA_LAPACKE_LIBRARIES}
+    ${LAPACK_LIBRARIES}
+    ${BLAS_LIBRARIES}
+    ${AIO_LIBRARY})
 
-# Section for tcmalloc. The DiskANN tools are always linked to tcmalloc. For Windows, they also need to
-# force-include the _tcmalloc symbol for enabling tcmalloc.
-#
-# The DLL itself needs to be linked to tcmalloc only if DISKANN_RELEASE_UNUSED_TCMALLOC_MEMORY_AT_CHECKPOINTS
-# is enabled.
-set(DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS "-ltcmalloc")
-
-if (DISKANN_RELEASE_UNUSED_TCMALLOC_MEMORY_AT_CHECKPOINTS)
-    add_definitions(-DRELEASE_UNUSED_TCMALLOC_MEMORY_AT_CHECKPOINTS)
+if(CBLAS_LIBRARY)
+  target_link_libraries(diskann PUBLIC ${CBLAS_LIBRARY})
 endif()
 
-if (NOT MSVC)
-    # set(DISKANN_ASYNC_LIB /home/xyzhi/spack-0.22.1/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/libaio-0.3.113-urdghmhnrglt3zw2z74jzsn5t2xd6c2p/lib/libaio.so)
-    # include_directories(/home/xyzhi/spack-0.22.1/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/libaio-0.3.113-urdghmhnrglt3zw2z74jzsn5t2xd6c2p/include)
-    set(DISKANN_ASYNC_LIB /data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/libaio-0.3.113-gk45wlx5vetueq7a43sa4di4uspbz3xb/lib/libaio.so)
-    include_directories(/data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/libaio-0.3.113-gk45wlx5vetueq7a43sa4di4uspbz3xb/include)
+target_compile_definitions(diskann PRIVATE _FILE_OFFSET_BITS=64)
+target_compile_options(diskann PRIVATE
+  $<$<CONFIG:Release>:-O3>
+  $<$<CONFIG:Debug>:-g>)
+
+if(COTRA_NATIVE_ARCH AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(diskann PRIVATE -march=native)
 endif()
 
-
-set(ENV{TCMALLOC_LARGE_ALLOC_REPORT_THRESHOLD} 500000000000)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2 -mfma -msse2 -ftree-vectorize -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free -fopenmp -fopenmp-simd -funroll-loops -Wfatal-errors -DUSE_AVX2")
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -DDEBUG")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DNDEBUG -fPIC")
-
-
-file(GLOB CPP_SOURCES diskann/src/*.cpp)
-if (RESTAPI)
-    list(APPEND CPP_SOURCES diskann/src/restapi/search_wrapper.cpp diskann/src/restapi/server.cpp)
-endif()
-add_library(diskann ${CPP_SOURCES})
-
-if (RESTAPI)
-    add_subdirectory(diskann/apps/restapi)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i.86)$")
+  include(CheckCXXCompilerFlag)
+  check_cxx_compiler_flag("-mavx2" COTRA_HAS_MAVX2)
+  check_cxx_compiler_flag("-mfma" COTRA_HAS_MFMA)
+  if(COTRA_HAS_MAVX2)
+    target_compile_options(diskann PRIVATE -mavx2)
+    target_compile_definitions(diskann PRIVATE USE_AVX2)
+  endif()
+  if(COTRA_HAS_MFMA)
+    target_compile_options(diskann PRIVATE -mfma)
+  endif()
 endif()
 
-include(diskann/clang-format.cmake)
-
-if(PYBIND)
-    add_subdirectory(diskann/python)
-endif()
-
-
+set(DISKANN_ASYNC_LIB "${AIO_LIBRARY}" PARENT_SCOPE)

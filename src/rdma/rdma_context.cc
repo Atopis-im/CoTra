@@ -3,6 +3,15 @@
 #include "anns/vec_buffer.h"
 #include "coromem/include/backend.h"
 
+namespace {
+bool gid_is_zero(const union ibv_gid &gid) {
+  for (unsigned char byte : gid.raw) {
+    if (byte != 0) return false;
+  }
+  return true;
+}
+}  // namespace
+
 struct ibv_device *ctx_find_dev(char **ib_devname) {
   int num_of_device;
   struct ibv_device **dev_list;
@@ -125,10 +134,8 @@ int RdmaContext::check_mtu(RdmaParameter *param) {
 }
 
 void RdmaContext::dealloc_ctx(RdmaParameter *param) {
-  if (qp != NULL) free(qp);
-
-  if (sge_list != NULL) free(sge_list);
-  if (wr != NULL) free(wr);
+  // qp, sge_list, and wr are inline arrays, not heap allocations. Resource
+  // teardown is handled by the process on this initialization failure path.
 }
 
 int RdmaContext::alloc_ctx(RdmaParameter *param) {
@@ -429,9 +436,27 @@ int RdmaContext::modify_qp_to_rtr(
   attr->ah_attr.src_path_bits = 0;
   attr->ah_attr.port_num = param->ib_port;
 
-  attr->ah_attr.dlid = dest->lid;
   attr->ah_attr.sl = param->sl;
-  attr->ah_attr.is_global = 0;
+  if (param->link_type == IBV_LINK_LAYER_ETHERNET) {
+    if (param->gid_index < 0) {
+      fprintf(stderr, "RoCE requires a valid local GID index\n");
+      return FAILURE;
+    }
+    if (gid_is_zero(dest->gid)) {
+      fprintf(stderr, "RoCE peer metadata contains an empty GID\n");
+      return FAILURE;
+    }
+    attr->ah_attr.dlid = 0;
+    attr->ah_attr.is_global = 1;
+    attr->ah_attr.grh.dgid = dest->gid;
+    attr->ah_attr.grh.sgid_index = param->gid_index;
+    attr->ah_attr.grh.hop_limit = 64;
+    attr->ah_attr.grh.traffic_class = 0;
+    attr->ah_attr.grh.flow_label = 0;
+  } else {
+    attr->ah_attr.dlid = dest->lid;
+    attr->ah_attr.is_global = 0;
+  }
 
   attr->path_mtu = param->curr_mtu;
   attr->dest_qp_num = dest->qpn;

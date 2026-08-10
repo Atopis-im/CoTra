@@ -19,6 +19,28 @@
 // #define PROFILER
 // #define COMM_PROFILE
 
+#if defined(__GNUC__) || defined(__clang__)
+#define PORTABLE_ALIGN32 __attribute__((aligned(32)))
+#define PORTABLE_ALIGN64 __attribute__((aligned(64)))
+#else
+#define PORTABLE_ALIGN32 __declspec(align(32))
+#define PORTABLE_ALIGN64 __declspec(align(64))
+#endif
+
+typedef enum {
+  SINGLE_MACHINE,
+  B1,
+  B1_MIGRATE,
+  B1_ASYNC,
+  B1_MIGRATE_ASYNC,
+  B2,
+  B2Kmeans,
+  B2KmeansBatch,
+  ScalaANN_ASYNC,
+  ScalaANN_v2,
+  ScalaANN_v3
+} AppType;
+
 #ifndef NO_MANUAL_VECTORIZATION
 #if (defined(__SSE__) || _M_IX86_FP > 0 || defined(_M_AMD64) || defined(_M_X64))
 #define USE_SSE
@@ -58,30 +80,8 @@ static uint64_t xgetbv(unsigned int index) {
 #include <immintrin.h>
 #endif
 
-#if defined(__GNUC__)
-#define PORTABLE_ALIGN32 __attribute__((aligned(32)))
-#define PORTABLE_ALIGN64 __attribute__((aligned(64)))
-#else
-#define PORTABLE_ALIGN32 __declspec(align(32))
-#define PORTABLE_ALIGN64 __declspec(align(64))
-#endif
-
 // Adapted from https://github.com/Mysticial/FeatureDetector
 #define _XCR_XFEATURE_ENABLED_MASK 0
-
-typedef enum {
-  SINGLE_MACHINE,
-  B1,
-  B1_MIGRATE,
-  B1_ASYNC,
-  B1_MIGRATE_ASYNC,
-  B2,
-  B2Kmeans,
-  B2KmeansBatch,
-  ScalaANN_ASYNC,
-  ScalaANN_v2,
-  ScalaANN_v3
-} AppType;
 
 static bool AVXCapable() {
   int cpuInfo[4];

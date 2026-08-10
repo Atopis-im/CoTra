@@ -17,6 +17,7 @@
 #include "coromem/include/runtime/range.h"
 #include "hash_table.h"
 #include "index/graph_index.h"
+#include "portable/prefetch.h"
 #include "query_msg.h"
 #include "rdma/rdma_comm.h"
 #include "scala_scheduler.h"

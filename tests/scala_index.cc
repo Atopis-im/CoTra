@@ -3,6 +3,7 @@
 
 #include <boost/program_options.hpp>
 
+#include "coromem/include/hwtopo.h"
 #include "coromem/include/share_mem.h"
 #include "coromem/include/utils.h"
 #include "index/scala_build.h"
@@ -13,8 +14,6 @@ int main(int argc, char **argv) {
   SharedMem coromem;
   commandLine cmd(argc, argv, "Usage : \n");
   RdmaParameter rdma_param(cmd);
-  auto &tp = getThreadPool();
-  tp.poolPause();
 
   IndexParameter index_param(argc, argv);
 
@@ -22,6 +21,16 @@ int main(int argc, char **argv) {
 
   // Start rdma server.
   scala_build.init_rdma();
+
+  // ThreadPool pins the main thread to its first CPU during construction.
+  // RDMA initialization needs those workers to remain alive, but release the
+  // main thread before partition() creates the GNU OpenMP worker pool. OpenMP
+  // workers retain the affinity they inherit when they are first created.
+  if (!unbindThreadSelf()) {
+    std::cerr << "Failed to release main-thread CPU affinity before index "
+                 "partitioning.\n";
+    return 1;
+  }
 
   // Start to do partition and dispatch.
   scala_build.partition();
@@ -41,8 +50,6 @@ int main(int argc, char **argv) {
   //   return 0;
   // }
   
-  tp.poolContiue();
-
   if (index_param.graph_type == GraphType::SCALA_V3){
     scala_build.write_partition_info();
 

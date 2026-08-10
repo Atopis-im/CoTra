@@ -1,5 +1,6 @@
 #include "rdma/rdma_param.h"
 
+#include "coromem/include/threadpool.h"
 #include "rdma/ip_config.h"
 
 RdmaParameter::RdmaParameter() {
@@ -10,12 +11,14 @@ RdmaParameter::RdmaParameter() {
   link_type = LINK_UNSPEC;
   gid_index = DEF_GID_INDEX;
   inline_size = DEF_INLINE;
+  out_reads = 0;
   pkey_index = 0;
   ai_family = AF_INET;
   cache_line_size = get_cache_line_size();
   // memory_create = host_memory_create;
   sl = 0;
   qp_timeout = DEF_QP_TIME;
+  barrier_timeout_seconds = DEF_BARRIER_TIMEOUT;
   cpu_freq_f = ON;
   ib_devname = NULL;
   thread_num = 1;
@@ -37,18 +40,46 @@ int RdmaParameter::parser(commandLine &cmd) {
   ip_config_file = cmd.getOptionValue("--config_file", "none");
 
   port = cmd.getOptionIntValue("-p", DEF_PORT);
-  auto ib_devname_str = cmd.getOptionValue("-d", "mlx4_0");
+  auto ib_devname_str = cmd.getOptionValue("-d", "mlx5_0");
   ALLOCATE(ib_devname, char, (ib_devname_str.size() + 1));
   strcpy(ib_devname, ib_devname_str.c_str());
+  ib_port = static_cast<uint8_t>(cmd.getOptionIntValue("--ib-port", DEF_IB_PORT));
+  gid_index = cmd.getOptionIntValue("--gid-index", DEF_GID_INDEX);
+  mtu = cmd.getOptionIntValue("--mtu", 0);
+  barrier_timeout_seconds =
+      cmd.getOptionIntValue("--barrier-timeout", DEF_BARRIER_TIMEOUT);
+  if (barrier_timeout_seconds < 1) {
+    fprintf(stderr, "--barrier-timeout must be a positive number of seconds\n");
+    abort();
+  }
 
   machine_num = MACHINE_NUM;
   // machine_id = cmd.getOptionIntValue("-m", 0);
   machine_id = get_machine_id(ip_config_file);
   machine_name = get_machine_name(ip_config_file);
+  if (machine_id < 0 || machine_name.size() != MACHINE_NUM) {
+    fprintf(
+        stderr,
+        "RDMA config must contain exactly %d machines and one local address\n",
+        MACHINE_NUM);
+    abort();
+  }
 
   // Set default thread number to max thread to avoid the potential error
   // caused by change of thread number.
-  thread_num = cmd.getOptionIntValue("-t", 1);
+  const int requested_threads = cmd.getOptionIntValue("-t", 1);
+  if (requested_threads < 1 || requested_threads > MAX_THREAD_NUM) {
+    fprintf(
+        stderr, "Thread count %d is outside the supported range [1, %d]\n",
+        requested_threads, MAX_THREAD_NUM);
+    abort();
+  }
+  thread_num = static_cast<int>(setActiveThreads(requested_threads));
+  if (thread_num != requested_threads) {
+    fprintf(
+        stderr, "Requested %d threads, but the process can use only %d CPUs\n",
+        requested_threads, thread_num);
+  }
   printf("qp num per machine = %d\n", machine_num);
 
   machine = machine_id == 0 ? LEADER : MEMBER;
@@ -71,6 +102,7 @@ void RdmaParameter::print_para() {
   printf("cache_line_size \t%d\n", cache_line_size);
   printf("sl              \t%d\n", sl);
   printf("qp_timeout      \t%d\n", qp_timeout);
+  printf("barrier_timeout \t%d seconds\n", barrier_timeout_seconds);
 }
 
 static int get_cache_line_size() {
@@ -275,11 +307,6 @@ int check_link(struct ibv_context *context, RdmaParameter *rdma_param) {
   if (set_link_layer(context, rdma_param) == FAILURE) {
     fprintf(stderr, " Couldn't set the link layer\n");
     return FAILURE;
-  }
-
-  if (rdma_param->link_type == IBV_LINK_LAYER_ETHERNET &&
-      rdma_param->gid_index == -1) {
-    rdma_param->gid_index = 0;
   }
 
   /* Compute Max inline size with pre found statistics values */

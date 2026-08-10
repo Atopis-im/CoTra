@@ -4,11 +4,11 @@
 #include "index/math_utils.h"
 
 #include <malloc.h>
-#include <mkl.h>
 
 #include <algorithm>
 #include <limits>
 
+#include "diskann/include/diskann_blas.h"
 #include "diskann/include/logger.h"
 #include "diskann/include/utils.h"
 

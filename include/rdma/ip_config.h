@@ -12,6 +12,7 @@
 
 // Get local machine ip addr.
 std::string get_local_ip_addr();
+std::vector<std::string> get_local_ip_addrs();
 // DNS
 std::string resolve_hostname(const std::string &hostname);
 // read ip_list

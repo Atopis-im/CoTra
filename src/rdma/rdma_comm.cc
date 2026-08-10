@@ -1,5 +1,21 @@
 #include "rdma/rdma_comm.h"
 
+#include <arpa/inet.h>
+
+#include <array>
+#include <chrono>
+#include <exception>
+#include <fstream>
+
+#include "rdma/ip_config.h"
+
+namespace {
+struct BuildSyncMessage {
+  uint32_t round;
+  uint32_t machine_id;
+};
+}  // namespace
+
 int RdmaCommunication::ethernet_leader_connect() {
   struct addrinfo *res, *t;
   struct addrinfo hints;
@@ -96,11 +112,19 @@ int RdmaCommunication::ethernet_member_connect(int leader_id) {
 }
 
 int RdmaCommunication::establish_connection() {
-  printf("Establish eathnet connection ...\n");
+  printf("Establish metadata connection ...\n");
 
-  sc = new ServerConnect(rdma_param, rdma_ctx);
-  auto myid = sc->get_my_id();
-  sc->barrier("RDMA-init");
+  try {
+    sc = new ServerConnect(rdma_param, rdma_ctx);
+    sc->barrier("RDMA-init");
+  } catch (const std::exception &error) {
+    fprintf(
+        stderr, "Unable to establish RDMA metadata connection: %s\n",
+        error.what());
+    delete sc;
+    sc = nullptr;
+    return 1;
+  }
 
   // for (int leader_id = 0; leader_id < MACHINE_NUM; leader_id++) {
   //   if (leader_id == rdma_param.machine_id) {
@@ -138,51 +162,98 @@ int RdmaCommunication::establish_connection() {
   return 0;
 }
 
-inline int ipv6_addr_v4mapped(const struct in6_addr *a) {
-  return ((a->s6_addr32[0] | a->s6_addr32[1]) |
-          (a->s6_addr32[2] ^ htonl(LOW_16BIT_MASK))) == 0UL ||
-         /* IPv4 encoded multicast addresses */
-         (a->s6_addr32[0] == htonl(0xff0e0000) &&
-          ((a->s6_addr32[1] | (a->s6_addr32[2] ^ htonl(LOW_16BIT_MASK))) ==
-           0UL));
+static bool gid_is_zero(const union ibv_gid &gid) {
+  for (unsigned char byte : gid.raw) {
+    if (byte != 0) return false;
+  }
+  return true;
 }
 
-int get_best_gid_index(RdmaContext *ctx, struct ibv_port_attr *attr, int port) {
-  int gid_index = 0, i;
-  union ibv_gid temp_gid, temp_gid_rival;
-  int is_ipv4, is_ipv4_rival;
+static std::string gid_ipv4_address(const union ibv_gid &gid) {
+  const auto *address = reinterpret_cast<const struct in6_addr *>(gid.raw);
+  if (!IN6_IS_ADDR_V4MAPPED(address)) return "";
 
-  for (i = 1; i < attr->gid_tbl_len; i++) {
-    if (ibv_query_gid(ctx->context, port, gid_index, &temp_gid)) {
-      return -1;
+  char buffer[INET_ADDRSTRLEN] = {};
+  struct in_addr ipv4;
+  memcpy(&ipv4, gid.raw + 12, sizeof(ipv4));
+  return inet_ntop(AF_INET, &ipv4, buffer, sizeof(buffer)) ? buffer : "";
+}
+
+static std::string gid_type(
+    RdmaContext *ctx, int port, int gid_index) {
+  const char *device_name = ibv_get_device_name(ctx->context->device);
+  std::string path = "/sys/class/infiniband/" + std::string(device_name) +
+                     "/ports/" + std::to_string(port) +
+                     "/gid_attrs/types/" + std::to_string(gid_index);
+  std::ifstream input(path);
+  std::string type;
+  std::getline(input, type);
+  return type;
+}
+
+int get_best_gid_index(
+    RdmaContext *ctx, struct ibv_port_attr *attr, int port,
+    const std::string &preferred_ipv4) {
+  int best_index = -1;
+  int best_score = -1;
+
+  for (int index = 0; index < attr->gid_tbl_len; ++index) {
+    union ibv_gid candidate;
+    memset(&candidate, 0, sizeof(candidate));
+    if (ibv_query_gid(ctx->context, port, index, &candidate) ||
+        gid_is_zero(candidate)) {
+      continue;
     }
 
-    if (ibv_query_gid(ctx->context, port, i, &temp_gid_rival)) {
-      return -1;
+    const std::string ipv4 = gid_ipv4_address(candidate);
+    const std::string type = gid_type(ctx, port, index);
+    int score = 1;
+    if (!ipv4.empty()) score += 20;
+    if (type.find("RoCE v2") != std::string::npos) score += 10;
+    if (!preferred_ipv4.empty() && ipv4 == preferred_ipv4) score += 100;
+
+    if (score > best_score) {
+      best_score = score;
+      best_index = index;
     }
-
-    is_ipv4 = ipv6_addr_v4mapped((struct in6_addr *)temp_gid.raw);
-    is_ipv4_rival = ipv6_addr_v4mapped((struct in6_addr *)temp_gid_rival.raw);
-
-    if (is_ipv4_rival && !is_ipv4) gid_index = i;
   }
-  return gid_index;
+  return best_index;
 }
 
 int RdmaCommunication::set_up_connection(RdmaContext *ctx) {
   union ibv_gid temp_gid;
   struct ibv_port_attr attr;
+  memset(&temp_gid, 0, sizeof(temp_gid));
 
   srand48(getpid() * time(NULL));
 
-  if (rdma_param.gid_index != -1) {
-    if (ibv_query_port(ctx->context, rdma_param.ib_port, &attr)) return 0;
+  if (rdma_param.link_type == IBV_LINK_LAYER_ETHERNET) {
+    if (ibv_query_port(ctx->context, rdma_param.ib_port, &attr)) return -1;
 
-    rdma_param.gid_index = get_best_gid_index(ctx, &attr, rdma_param.ib_port);
-    if (rdma_param.gid_index < 0) return -1;
+    if (rdma_param.gid_index < 0 ||
+        rdma_param.gid_index >= attr.gid_tbl_len) {
+      fprintf(stderr, "Unable to select a usable RoCE GID index\n");
+      return -1;
+    }
     if (ibv_query_gid(
             ctx->context, rdma_param.ib_port, rdma_param.gid_index, &temp_gid))
       return -1;
+    if (gid_is_zero(temp_gid)) {
+      fprintf(
+          stderr, "Selected RoCE GID index %d is empty\n",
+          rdma_param.gid_index);
+      return -1;
+    }
+
+    char gid_buffer[INET6_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET6, temp_gid.raw, gid_buffer, sizeof(gid_buffer));
+    if (ThreadPool::getTID() == 0) {
+      printf(
+          "Using RoCE device %s port %u GID index %d (%s, %s)\n",
+          ibv_get_device_name(ctx->context->device), rdma_param.ib_port,
+          rdma_param.gid_index, gid_buffer,
+          gid_type(ctx, rdma_param.ib_port, rdma_param.gid_index).c_str());
+    }
   }
 
   for (int i = 0; i < rdma_param.machine_num; i++) {
@@ -437,6 +508,29 @@ void RdmaCommunication::com_init(
     exit(0);
   }
 
+  if (rdma_param.link_type == IBV_LINK_LAYER_ETHERNET &&
+      rdma_param.gid_index < 0) {
+    struct ibv_port_attr port_attr;
+    if (ibv_query_port(
+            main_ctx->context, rdma_param.ib_port, &port_attr)) {
+      fprintf(stderr, "Unable to query the RoCE port GID table\n");
+      exit(1);
+    }
+    std::string preferred_ipv4;
+    if (rdma_param.machine_id >= 0 &&
+        static_cast<size_t>(rdma_param.machine_id) <
+            rdma_param.machine_name.size()) {
+      preferred_ipv4 =
+          resolve_hostname(rdma_param.machine_name[rdma_param.machine_id]);
+    }
+    rdma_param.gid_index = get_best_gid_index(
+        main_ctx, &port_attr, rdma_param.ib_port, preferred_ipv4);
+    if (rdma_param.gid_index < 0) {
+      fprintf(stderr, "Unable to auto-select a usable RoCE GID index\n");
+      exit(1);
+    }
+  }
+
   // rdma_param.memory_create = host_memory_create;
 
   for (int t = 1; t < getActiveThreads(); t++) {
@@ -615,6 +709,10 @@ int RdmaCommunication::poll_send() {
   auto *ctx = rdma_ctx.getLocal();
 
   int ne = ctx->poll_SEND();
+  if (ne < 0) {
+    fprintf(stderr, "Fatal: failed to poll the RDMA send completion queue\n");
+    abort();
+  }
   if (ne > 0) {
     for (int i = 0; i < ne; i++) {
       auto &wc = ctx->s_wc[i];
@@ -624,7 +722,7 @@ int RdmaCommunication::poll_send() {
             stderr, " Failed status %d: qid %d buff %d syndrom 0x%x\n",
             wc.status, (int)wc.wr_id >> 16, (int)(wc.wr_id & LOW_16BIT_MASK),
             wc.vendor_err);
-        return -1;
+        abort();
       }
       uint64_t wr_id = wc.wr_id;
       // TODO: change to switch.
@@ -664,6 +762,10 @@ int RdmaCommunication::poll_recv() {
   auto *ctx = rdma_ctx.getLocal();
 
   int ne = ctx->poll_RECV();
+  if (ne < 0) {
+    fprintf(stderr, "Fatal: failed to poll the RDMA receive completion queue\n");
+    abort();
+  }
   if (ne > 0) {
     // printf("ne: %d\n", ne);
     for (int i = 0; i < ne; i++) {
@@ -675,7 +777,7 @@ int RdmaCommunication::poll_recv() {
             " Failed status %d: machine %d true_wr_id %d syndrom 0x%x\n",
             wc.status, (int)wc.wr_id >> 16, (int)(wc.wr_id & LOW_16BIT_MASK),
             wc.vendor_err);
-        return -1;
+        abort();
       }
 
       uint64_t wr_id = wc.wr_id;
@@ -721,6 +823,12 @@ int RdmaCommunication::poll_recv() {
           memcpy(part_info, ptr, data_size);
           rbuf->part_info_queue.push_back(part_info);
         } else if (control == BUILD_SYNC) {
+          if (data_size != sizeof(BuildSyncMessage)) {
+            fprintf(
+                stderr, "Invalid build barrier message size: %u (expected %zu)\n",
+                data_size, sizeof(BuildSyncMessage));
+            abort();
+          }
           char *sync_info = (char *)malloc(data_size);
           memcpy(sync_info, ptr, data_size);
           rbuf->build_sync_queue.push_back(sync_info);
@@ -954,7 +1062,10 @@ int RdmaCommunication::post_read(
 
   for (uint32_t m : machines) {
     // printf("READ machine %d\n", m);
-    ctx->run_post_read(m);
+    if (ctx->run_post_read(m)) {
+      fprintf(stderr, "Failed to post RDMA read to machine %u\n", m);
+      abort();
+    }
   }
 
   return 0;
@@ -1061,8 +1172,13 @@ int RdmaCommunication::post_write_send(
     printf("Error: Exceed the max write buffer size.\n");
     abort();
   }
-  ctx->run_post_write_send(
-      machine_id, buf_id, offset, size, control << 16 | buf_id);
+  if (ctx->run_post_write_send(
+          machine_id, buf_id, offset, size, control << 16 | buf_id)) {
+    fprintf(
+        stderr, "Failed to post RDMA write to machine %d buffer %u\n",
+        machine_id, buf_id);
+    abort();
+  }
   return 0;
 }
 
@@ -1072,15 +1188,26 @@ int RdmaCommunication::post_sg_write_send(
   auto *ctx = rdma_ctx.getLocal();
   size_t offset = MAX_QUERYBUFFER_SIZE * buf_id;
   // TODO: <<16 use macro
-  ctx->run_post_sg_write_send(
-      machine_id, buf_id, offset, sg_ptr, sg_size, control << 16 | buf_id);
+  if (ctx->run_post_sg_write_send(
+          machine_id, buf_id, offset, sg_ptr, sg_size,
+          control << 16 | buf_id)) {
+    fprintf(
+        stderr, "Failed to post scatter/gather RDMA write to machine %d\n",
+        machine_id);
+    abort();
+  }
   return 0;
 }
 
 int RdmaCommunication::post_write_recv(int machine_id, uint32_t buf_id) {
   // printf("post recv write buf %d\n", buf_id);
   auto *ctx = rdma_ctx.getLocal();
-  ctx->run_post_write_recv(machine_id, buf_id);
+  if (ctx->run_post_write_recv(machine_id, buf_id)) {
+    fprintf(
+        stderr, "Failed to post RDMA receive for machine %d buffer %u\n",
+        machine_id, buf_id);
+    abort();
+  }
   // printf("post recv write buf %d over\n", buf_id);
   return 0;
 }
@@ -1233,30 +1360,64 @@ void RdmaCommunication::poll_partition_info(IndexParameter &index_param) {
 }
 
 void RdmaCommunication::build_sync() {
-  uint32_t sync_cnt = 0;
+  const uint32_t round = build_sync_round++;
+  std::array<bool, MACHINE_NUM> seen{};
+  seen[rdma_param.machine_id] = true;
+  uint32_t sync_cnt = 1;
+
   // send sync to all other machines.
   for (uint32_t m = 0; m < MACHINE_NUM; m++) {
     if (m == rdma_param.machine_id) continue;
     auto *buf = send_write_buf.getLocal();
     uint32_t buf_id = get_write_send_buf(m);
-    memcpy(buf->buffer[m][buf_id], &rdma_param.machine_id, sizeof(uint32_t));
-    post_write_send(m, buf_id, sizeof(uint32_t), BUILD_SYNC);
+    BuildSyncMessage message{
+        round, static_cast<uint32_t>(rdma_param.machine_id)};
+    memcpy(buf->buffer[m][buf_id], &message, sizeof(message));
+    post_write_send(m, buf_id, sizeof(message), BUILD_SYNC);
   }
-  sync_cnt++;
 
   auto *rbuf = recv_write_buf.getLocal();  // recv buffer
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(rdma_param.barrier_timeout_seconds);
   while (sync_cnt < MACHINE_NUM) {
     poll_send();
     poll_recv();
-    // Collect recved partition info.
-    // NOTE: sync_cnt may exceed MACHINE_NUM when sync frequent, so we need to
-    // check sync_cnt.
-    while (rbuf->build_sync_queue.size() > 0 && sync_cnt < MACHINE_NUM) {
+
+    const size_t queued_messages = rbuf->build_sync_queue.size();
+    for (size_t i = 0; i < queued_messages; ++i) {
       char *build_sync_ptr = rbuf->build_sync_queue.front();
       rbuf->build_sync_queue.pop_front();
-      // printf("[Recv migrate q%d]\n", new_query->query_id);
+      BuildSyncMessage message{};
+      memcpy(&message, build_sync_ptr, sizeof(message));
+
+      if (message.machine_id >= MACHINE_NUM) {
+        fprintf(
+            stderr, "Invalid machine ID %u in build barrier\n",
+            message.machine_id);
+        free(build_sync_ptr);
+        abort();
+      }
+      if (message.round > round) {
+        rbuf->build_sync_queue.push_back(build_sync_ptr);
+        continue;
+      }
+
       free(build_sync_ptr);
-      sync_cnt++;
+      if (message.round == round && !seen[message.machine_id]) {
+        seen[message.machine_id] = true;
+        ++sync_cnt;
+      }
+    }
+
+    if (std::chrono::steady_clock::now() >= deadline) {
+      fprintf(
+          stderr, "Build barrier round %u timed out after %d seconds; missing:",
+          round, rdma_param.barrier_timeout_seconds);
+      for (uint32_t m = 0; m < MACHINE_NUM; ++m) {
+        if (!seen[m]) fprintf(stderr, " %u", m);
+      }
+      fprintf(stderr, "\n");
+      abort();
     }
   }
 }

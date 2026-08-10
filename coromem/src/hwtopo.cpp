@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -80,6 +81,15 @@ unsigned getNumaNode(cpuinfo &c) {
   return i;
 }
 
+static unsigned readCPUTopologyValue(
+    unsigned cpu, const std::string &name, unsigned fallback) {
+  std::ifstream input(
+      "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/" +
+      name);
+  int value = -1;
+  return input >> value && value >= 0 ? static_cast<unsigned>(value) : fallback;
+}
+
 std::vector<cpuinfo> parseCPUInfo() {
   std::vector<cpuinfo> vals;
 
@@ -102,6 +112,9 @@ std::vector<cpuinfo> parseCPUInfo() {
       cur = num;
       vals.resize(cur + 1);
       vals.at(cur).proc = num;
+      // AArch64 /proc/cpuinfo commonly omits x86 topology fields. Keep every
+      // CPU as a distinct core until sysfs supplies the actual topology.
+      vals.at(cur).coreid = num;
     } else if (sscanf(line.data(), "physical id : %d", &num) == 1) {
       vals.at(cur).physid = num;
     } else if (sscanf(line.data(), "siblings : %d", &num) == 1) {
@@ -113,7 +126,12 @@ std::vector<cpuinfo> parseCPUInfo() {
     }
   }
 
-  for (auto &c : vals) c.numaNode = getNumaNode(c);
+  for (auto &c : vals) {
+    c.physid =
+        readCPUTopologyValue(c.proc, "physical_package_id", c.physid);
+    c.coreid = readCPUTopologyValue(c.proc, "core_id", c.coreid);
+    c.numaNode = getNumaNode(c);
+  }
 
   return vals;
 }
@@ -295,19 +313,23 @@ bool unbindThreadSelf() {
   /* CPU_ZERO initializes all the bits in the mask to zero. */
   CPU_ZERO(&mask);
 
-  /* Get the number of processors available. */
-  int numCPUs = sysconf(_SC_NPROCESSORS_ONLN);
-  if (numCPUs <= 0) {
-    printf(
-        "Failed to get the number of available processors (%s)",
-        strerror(errno));
+  /* Restore the CPU set that was available when the topology was read. */
+  const auto topology = getHWTopo();
+  if (topology.threadTopoInfo.empty()) {
+    printf("Failed to restore CPU affinity: no available CPUs\n");
     return false;
   }
 
-  /* CPU_SET all available CPUs in the mask. */
-  std::cout << "reset CPU num:" << numCPUs << std::endl;
-  for (int i = 0; i < numCPUs; ++i) {
-    (void)CPU_SET(i, &mask);
+  std::cout << "reset CPU num:" << topology.threadTopoInfo.size()
+            << std::endl;
+  for (const auto &thread : topology.threadTopoInfo) {
+    if (thread.osContext >= CPU_SETSIZE) {
+      printf(
+          "Failed to restore CPU affinity: CPU %u exceeds CPU_SETSIZE\n",
+          thread.osContext);
+      return false;
+    }
+    (void)CPU_SET(thread.osContext, &mask);
   }
 
   /* sched_setaffinity returns 0 on success */

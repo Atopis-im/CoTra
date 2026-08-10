@@ -14,6 +14,7 @@
 #include "anns/anns_param.h"
 #include "anns/task_manager.h"
 #include "index/index_param.h"
+#include "portable/prefetch.h"
 #include "vamana/vamana.h"
 #include "worklists/balance_queue.h"
 

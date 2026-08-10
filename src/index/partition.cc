@@ -26,15 +26,10 @@
 #include "index/partition.h"
 // #include "abstract_data_store.h"
 // #include "in_mem_data_store.h"
-#ifdef _WINDOWS
-#include <xmmintrin.h>
-#endif
-
-#include <faiss/Index.h>
-#include <faiss/IndexFlat.h>
 #include <filesystem>
 
 #include "coromem/include/utils.h"
+#include "portable/prefetch.h"
 
 // block size for reading/ processing large files and matrices in blocks
 #define BLOCK_SIZE 500000

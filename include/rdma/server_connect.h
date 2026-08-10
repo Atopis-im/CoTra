@@ -8,7 +8,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -62,6 +64,7 @@ class ServerConnect {
   uint16_t my_id;       // memcached id
   uint16_t machine_id;  // machine id
   std::string my_ip;
+  int timeout_seconds;
 
   memcached_st *memc;
 
@@ -80,22 +83,29 @@ class ServerConnect {
       RdmaParameter &rdma_param, PerThreadStorage<RdmaContext> &_rdma_ctx)
       : max_machine(MACHINE_NUM),
         cur_machine_num(0),
-        memc(NULL),
+        my_id(0),
         machine_id(rdma_param.machine_id),
+        my_ip(rdma_param.machine_name.at(rdma_param.machine_id)),
+        timeout_seconds(rdma_param.barrier_timeout_seconds),
+        memc(NULL),
         rdma_ctx(_rdma_ctx) {
     init();
+    try {
+      if (!connect_mc(rdma_param.ip_config_file)) {
+        throw std::runtime_error("Unable to configure the memcached connection");
+      }
+      add_machine();
 
-    if (!connect_mc(rdma_param.ip_config_file)) {
-      return;
+      // Set local machine.
+      setDataToRemote(machine_id);
+      setDataFromRemote(get_my_id(), &local_meta[machine_id]);
+
+      connect_machine();
+      init_route();
+    } catch (...) {
+      disconnect_mc();
+      throw;
     }
-    add_machine();
-
-    // Set local machine.
-    setDataToRemote(machine_id);
-    setDataFromRemote(get_my_id(), &local_meta[machine_id]);
-
-    connect_machine();
-    init_route();
   }
   ~ServerConnect();
 

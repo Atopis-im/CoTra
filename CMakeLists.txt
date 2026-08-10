@@ -1,98 +1,154 @@
-cmake_minimum_required(VERSION 3.0)
-project(rdma-anns)
+cmake_minimum_required(VERSION 3.16)
+project(CoTra LANGUAGES C CXX)
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+   CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10.3)
+  message(FATAL_ERROR
+    "CoTra requires GCC 10.3 or newer for C++20 coroutines; found "
+    "${CMAKE_CXX_COMPILER_VERSION}")
+endif()
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# GCC 10 implements C++20 coroutines behind an explicit experimental flag.
+# GCC 11 and newer enable the standard coroutine implementation in C++20 mode.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+   CMAKE_CXX_COMPILER_VERSION VERSION_LESS 11)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fcoroutines>)
+endif()
+
+option(COTRA_NATIVE_ARCH "Optimize for the CPU used to build CoTra" ON)
+set(COTRA_MACHINE_NUM 16 CACHE STRING
+  "Number of CoTra machines; every node must use the same value")
+set(COTRA_MAX_THREAD_NUM 128 CACHE STRING
+  "Maximum worker threads represented in exchanged RDMA metadata")
+
+if(NOT COTRA_MACHINE_NUM MATCHES "^[1-9][0-9]*$")
+  message(FATAL_ERROR "COTRA_MACHINE_NUM must be a positive integer")
+endif()
+if(NOT COTRA_MAX_THREAD_NUM MATCHES "^[1-9][0-9]*$")
+  message(FATAL_ERROR "COTRA_MAX_THREAD_NUM must be a positive integer")
+endif()
+
+add_compile_definitions(
+  HAVE_CXX0X
+  MACHINE_NUM=${COTRA_MACHINE_NUM}
+  MAX_THREAD_NUM=${COTRA_MAX_THREAD_NUM})
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_compile_definitions(_FILE_OFFSET_BITS=64)
+endif()
+
+if(COTRA_NATIVE_ARCH AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  add_compile_options(-march=native)
+endif()
+
+add_compile_options(
+  $<$<CONFIG:Release>:-O3>
+  $<$<CONFIG:Debug>:-g>)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules")
 
-set(CMAKE_BUILD_TYPE "Release")
-
-message(STATUS "Build CoroMem library")
-
-include(GNUInstallDirs)
-include(CheckCXXCompilerFlag)
-
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-set(CMAKE_CXX_COMPILER /data/share/users/xyzhi/spack/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/gcc-11.4.0-dwr4wdspczmg4ssoib2ftvjodmdydhk2/bin/g++)
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-
-SET(CMAKE_CXX_FLAGS  "-Ofast -lrt -DHAVE_CXX0X -march=native -fpic -w -fopenmp -ftree-vectorize -ftree-vectorizer-verbose=0 -shared-libgcc -fcoroutines -fopenmp" )
-
-set(CMAKE_THREAD_LIBS_INIT "-lpthread")
-
 find_package(Threads REQUIRED)
-find_package(Boost 1.58.0 REQUIRED COMPONENTS serialization iostreams)
-find_library(MEMCACHED_LIB memcached REQUIRED)
+find_package(OpenMP REQUIRED)
+find_package(Boost 1.58 REQUIRED COMPONENTS
+  serialization iostreams program_options system filesystem)
+find_package(fmt REQUIRED)
 
-include_directories(./third_party)
-set(THIRD_PARTY_DIR ${CMAKE_SOURCE_DIR}/third_party)
-add_subdirectory(${THIRD_PARTY_DIR})
+find_path(MEMCACHED_INCLUDE_DIR NAMES libmemcached/memcached.h)
+find_library(MEMCACHED_LIBRARY NAMES memcached)
+find_path(IBVERBS_INCLUDE_DIR NAMES infiniband/verbs.h)
+find_library(IBVERBS_LIBRARY NAMES ibverbs)
+find_path(RDMACM_INCLUDE_DIR NAMES rdma/rdma_cma.h)
+find_library(RDMACM_LIBRARY NAMES rdmacm)
+
+foreach(required_var IN ITEMS
+    MEMCACHED_INCLUDE_DIR MEMCACHED_LIBRARY
+    IBVERBS_INCLUDE_DIR IBVERBS_LIBRARY
+    RDMACM_INCLUDE_DIR RDMACM_LIBRARY)
+  if(NOT ${required_var})
+    message(FATAL_ERROR "Required dependency was not found: ${required_var}")
+  endif()
+endforeach()
+
+add_subdirectory(third_party)
 
 add_custom_target(lib)
 add_subdirectory(coromem)
 
-message(STATUS "Build RDMA library")
+file(GLOB RDMA_ANNS_SOURCES CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/rdma/*.cc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/anns/*.cc")
 
-# for rdma deps
-link_libraries(pthread /usr/lib/x86_64-linux-gnu/libibverbs.so.1 /usr/lib/x86_64-linux-gnu/librdmacm.so.1 ${MEMCACHED_LIB})
-include_directories("${PROJECT_SOURCE_DIR}" "/data/share/project/grasper/rdma-core/build/include")
+add_library(rdma_anns STATIC ${RDMA_ANNS_SOURCES})
+target_include_directories(rdma_anns
+  PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/diskann/include"
+  PRIVATE
+    "${MEMCACHED_INCLUDE_DIR}"
+    "${IBVERBS_INCLUDE_DIR}"
+    "${RDMACM_INCLUDE_DIR}")
+target_link_libraries(rdma_anns
+  PUBLIC
+    coromem
+    Threads::Threads
+    OpenMP::OpenMP_CXX
+    Boost::serialization
+    Boost::iostreams
+    Boost::program_options
+    Boost::system
+    Boost::filesystem
+    fmt::fmt
+    ${MEMCACHED_LIBRARY}
+    ${IBVERBS_LIBRARY}
+    ${RDMACM_LIBRARY}
+    ${CMAKE_DL_LIBS}
+    m)
 
-add_library(rdma_anns)
-file(GLOB sources 
-  ${CMAKE_SOURCE_DIR}/src/*.cc 
-  ${CMAKE_SOURCE_DIR}/src/rdma/*.cc 
-  ${CMAKE_SOURCE_DIR}/src/anns/*.cc 
-)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_libraries(rdma_anns PUBLIC rt)
+endif()
 
-target_sources(rdma_anns PRIVATE ${sources})
+file(GLOB RDMA_INDEX_SOURCES CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/index/*.cc")
 
-target_include_directories(rdma_anns PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>
-)
-
-
-set(POSSIBLE_OMP_PATHS "/data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/intel-oneapi-mkl-2024.0.0-a4e6uj4nsyq4llk43fbax6eobust7uug/compiler/latest/lib/libiomp5.so")
-    
-foreach(POSSIBLE_OMP_PATH ${POSSIBLE_OMP_PATHS})
-    if (EXISTS ${POSSIBLE_OMP_PATH})
-        get_filename_component(OMP_PATH ${POSSIBLE_OMP_PATH} DIRECTORY)
-    endif()
-endforeach()
-link_directories(${OMP_PATH})
-
-set(POSSIBLE_MKL_LIB_PATHS "/data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/intel-oneapi-mkl-2024.0.0-a4e6uj4nsyq4llk43fbax6eobust7uug/mkl/latest/lib/intel64/libmkl_core.so")
-
-foreach(POSSIBLE_MKL_LIB_PATH ${POSSIBLE_MKL_LIB_PATHS})
-    if (EXISTS ${POSSIBLE_MKL_LIB_PATH})
-        get_filename_component(MKL_PATH ${POSSIBLE_MKL_LIB_PATH} DIRECTORY)
-    endif()
-endforeach()
-set(POSSIBLE_MKL_INCLUDE_PATHS "/data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/intel-oneapi-mkl-2024.0.0-a4e6uj4nsyq4llk43fbax6eobust7uug/mkl/latest/include")
-foreach(POSSIBLE_MKL_INCLUDE_PATH ${POSSIBLE_MKL_INCLUDE_PATHS})
-    if (EXISTS ${POSSIBLE_MKL_INCLUDE_PATH})
-        set(MKL_INCLUDE_PATH ${POSSIBLE_MKL_INCLUDE_PATH})
-    endif()
-endforeach()
-MESSAGE(STATUS "index MKL_PATH: ${MKL_PATH}")
-link_directories(${MKL_PATH})
-include_directories(${MKL_INCLUDE_PATH})
-
-find_package(Boost COMPONENTS program_options system filesystem)
-
-link_libraries(mkl_intel_ilp64 mkl_intel_thread mkl_core iomp5 pthread m dl ${Boost_LIBRARIES})
-
-add_library(rdma_index)
-file(GLOB index_sources 
-  ${CMAKE_SOURCE_DIR}/src/index/*.cc
-)
-target_sources(rdma_index PRIVATE ${index_sources})
-target_include_directories(rdma_index PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>
-)
+add_library(rdma_index STATIC ${RDMA_INDEX_SOURCES})
+target_include_directories(rdma_index
+  PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/diskann/include")
+target_link_libraries(rdma_index
+  PUBLIC
+    rdma_anns
+    diskann
+    coromem
+    OpenMP::OpenMP_CXX
+    Boost::program_options
+    Boost::system
+    Boost::filesystem)
 
 add_subdirectory(tests)
 
-
+message(STATUS "")
+message(STATUS "CoTra configuration")
+message(STATUS "  Architecture:       ${CMAKE_SYSTEM_PROCESSOR}")
+message(STATUS "  Compiler:           ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+message(STATUS "  Machine count:      ${COTRA_MACHINE_NUM}")
+message(STATUS "  Max worker threads: ${COTRA_MAX_THREAD_NUM}")
+message(STATUS "  Native tuning:      ${COTRA_NATIVE_ARCH}")
+message(STATUS "  BLAS libraries:     ${BLAS_LIBRARIES}")
+message(STATUS "")
