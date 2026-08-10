@@ -811,6 +811,10 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
     rdma_comm.com_init(partition_ptr, partition_size, rdma_param);
     rdma_comm.com_read_init();
     rdma_comm.com_write_init();
+    if (rdma_comm.sc) {
+      rdma_comm.sc->barrier("RDMA-search-ready");
+    }
+    printf("RDMA search barrier passed, all nodes ready.\n");
   }
 
   void end_rdma() {

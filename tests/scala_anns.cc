@@ -3,6 +3,8 @@
 
 // ../scripts/scala_anns.sh
 int main(int argc, char **argv) {
+  setbuf(stdout, NULL);
+  setbuf(stderr, NULL);
   SharedMem coromem;
   // coromem.tp.hw_info.show();
 
