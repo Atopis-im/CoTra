@@ -39,7 +39,7 @@ static void test_vs_recall(
   vector<size_t> efs = {30, 400};
 #else
   // repeat first for warmup.
-  vector<size_t> efs = {3, 4, 5, 6, 8, 10, 15, 20, 30, 40, 50, 70, 100, 150, 200, 250, 300, 400, 500, 600, 700};
+  vector<size_t> efs = {3, 4, 5, 6, 8, 10, 15, 20, 30, 40, 50, 70, 100, 150, 200, 250, 300, 350, 400, 500, 600, 700};
 #endif
 
 #if defined(PROF_Q_DISTRI) || defined(PROF_ALL_Q_DISTRI)
@@ -627,6 +627,11 @@ static void test_vs_recall(
 #endif
               if (tid == 0) {
                 double cumu_lat_us = 0.0;
+#ifdef LAT
+                for (uint32_t q = load_start; q < load_start + query_load; q++) {
+                  cumu_lat_us += duration_cast<std::chrono::microseconds>(end[q] - start[q]).count();
+                }
+#endif
                 appr_alg.sendTerm(correct.load(), total.load(), query_load, cumu_lat_us);
               }
 #ifdef DEBUG
