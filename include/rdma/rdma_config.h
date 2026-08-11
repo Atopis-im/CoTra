@@ -15,7 +15,8 @@
 #define GROUP_SIZE (16)
 // NOTE: MAX_READ_NUM is the max read num one thread cand send to one machine
 #define MAX_READ_NUM (2 * GROUP_SIZE)
-#define MAX_VEC_LEN (2560)
+// #define MAX_VEC_LEN (2560)
+#define MAX_VEC_LEN (4096)
 // #define MAX_QUERYBUFFER_SIZE (32768)
 // #define MAX_QUERYBUFFER_SIZE (8192)
 #define MAX_QUERYBUFFER_SIZE (24576)

@@ -7,6 +7,7 @@
 #include <exception>
 #include <fstream>
 
+#include "coromem/include/threadpool.h"
 #include "rdma/ip_config.h"
 
 namespace {
@@ -766,6 +767,17 @@ int RdmaCommunication::poll_recv() {
     fprintf(stderr, "Fatal: failed to poll the RDMA receive completion queue\n");
     abort();
   }
+
+    // [DEBUG] Periodic log when CQ is empty
+  {
+    static thread_local uint64_t _dbg_poll_cnt = 0;
+    _dbg_poll_cnt++;
+    if (_dbg_poll_cnt % 1000000 == 0) {
+      printf("[DBG-POLL][T%u] recv_cq ne=%d total_polls=%lu\n",
+             ThreadPool::getTID(), ne, _dbg_poll_cnt);
+    }
+  }
+
   if (ne > 0) {
     // printf("ne: %d\n", ne);
     for (int i = 0; i < ne; i++) {
@@ -793,23 +805,42 @@ int RdmaCommunication::poll_recv() {
         uint32_t imm = ntohl(wc.imm_data);
         ControlType control = ControlType(imm >> 16);
         uint32_t buf_id = imm & LOW_16BIT_MASK;
-        char *ptr = (char *)rbuf->buffer[m_id][buf_id];
-
-        // printf(
-        //     "recv write imm, bufid %d control %d size %d\n", buf_id, control,
-        //     data_size);
+        
+        // Validate recv buffer index: data arrives at position true_wr_id
+        // (receiver's recv buf_id from wr_id), NOT buf_id (sender's send
+        // buf_id from imm_data).  These two values start in sync but can
+        // diverge under load; using buf_id here was a latent bug that caused
+        // reads from stale/wrong buffers, corrupting buff_id_list with
+        // garbage values (e.g. 1999 > MAX_WRITE_NUM).
+        if (true_wr_id >= MAX_WRITE_NUM) {
+          fprintf(stderr,
+          "FATAL [poll_recv]: true_wr_id %u >= MAX_WRITE_NUM %d (m%u control %d)\n",
+          true_wr_id, MAX_WRITE_NUM, m_id, control);
+          abort();
+        }
+        char *ptr = (char *)rbuf->buffer[m_id][true_wr_id];
         
         // TODO: use switch
         if (control == RELEASE || control == CLEAR) {
           // proc the released send buffer id.
-          int *release_ptr = (int *)ptr;
-          int num = release_ptr[0];
-          // printf("==> get release id ");
-          for (int i = 1; i < num + 1; i++) {
-            sbuf->buff_id_list[m_id]->push_back(release_ptr[i]);
-            // printf("%d ", release_ptr[i]);
+          uint32_t *release_ptr = (uint32_t *)ptr;
+          uint32_t num = release_ptr[0];
+          if (num > MAX_WRITE_NUM) {
+            fprintf(stderr,
+            "FATAL [poll_recv]: RELEASE num %u > MAX_WRITE_NUM %d from m%u, aborting\n",
+            num, MAX_WRITE_NUM, m_id);
+            abort();
           }
-          // printf("\n");
+          for (uint32_t i = 1; i <= num; i++) {
+            uint32_t release_id = release_ptr[i];
+            if (release_id >= MAX_WRITE_NUM) {
+              fprintf(stderr,
+              "FATAL [poll_recv]: RELEASE buf_id %u >= MAX_WRITE_NUM %d from m%u, aborting\n",
+              release_id, MAX_WRITE_NUM, m_id);
+              abort();
+            }
+            sbuf->buff_id_list[m_id]->push_back(release_id);
+          }
         } else if (control == B2_START) {
           char *b2_info = (char *)malloc(data_size);
           memcpy(b2_info, ptr, data_size);
@@ -939,6 +970,12 @@ int RdmaCommunication::poll_recv() {
 }
 
 void RdmaCommunication::send_write_release(int machine_id, uint32_t buf_id) {
+  if (buf_id >= MAX_WRITE_NUM) {
+    fprintf(stderr,
+    "FATAL [send_write_release]: buf_id %u >= MAX_WRITE_NUM %d from m%u, aborting\n",
+    buf_id, MAX_WRITE_NUM, machine_id);
+    abort();
+  }
   auto *rbuf = recv_write_buf.getLocal();
   rbuf->release_id_list[machine_id]->push_back(buf_id);
   // printf(
@@ -1007,7 +1044,7 @@ char *RdmaCommunication::sync_read(
       BufferCache(machine_id, internal_id, internal_id, -1, NULL)};
   post_read(vecs, size);
   poll_read();
-  release_cache(vecs[0].buffer_id);
+  release_cache(vecs[0].buffer_id, vecs[0].owner_thread);
   return vecs[0].buffer_ptr;
 }
 
@@ -1021,6 +1058,7 @@ int RdmaCommunication::post_read(
     std::vector<BufferCache> &vectors, size_t vec_size, uint32_t query_id) {
   auto *ctx = rdma_ctx.getLocal();
   auto *buf = read_buf.getLocal();
+  const uint32_t owner_thread = ThreadPool::getTID();
 
   // ctx->run_post_read(vectors, vec_size);
   // TODO: change to buffer queue.
@@ -1035,6 +1073,7 @@ int RdmaCommunication::post_read(
     vec.buffer_id = buf->buff_id_list.front();
     buf->buff_id_list.pop_front();
     vec.buffer_ptr = (char *)ctx->read_to_ptr[vec.buffer_id];
+    vec.owner_thread = owner_thread;
     buf->bufcache_ptr[vec.buffer_id] = vec;
     // printf("postread buf_id %u vid %u\n", vec.buffer_id, vec.vector_id);
     size_t &r = ctx->wr_cnt[m];
@@ -1083,13 +1122,9 @@ int RdmaCommunication::poll_read() {
   return 0;
 }
 
-void RdmaCommunication::release_cache(int buffer_id) {
-  // printf("release cache %d\n", buffer_id);
-  auto *buf = read_buf.getLocal();
+void RdmaCommunication::release_cache(int buffer_id, uint32_t owner_thread) {
+  auto *buf = read_buf.getRemote(owner_thread);
   buf->buff_id_list.push_back(buffer_id);
-  // printf(
-  //     "release cache %d buflist sz %u\n", buffer_id,
-  //     buf->buff_id_list.size());
   return;
 }
 
@@ -1131,6 +1166,30 @@ int RdmaCommunication::get_write_send_buf(
     do {
       poll_send();
       poll_recv();  // Recv released buffer indicate by control.
+      // Flush pending release IDs immediately to prevent deadlock when
+      // both nodes are spinning with send buffers exhausted.
+      auto *rbuf = recv_write_buf.getLocal();
+      if (rbuf->release_id_list[machine_id]->size() > 0 &&
+      sbuf->buff_id_list[machine_id]->size() > 0) {
+      uint32_t num = 0;
+      uint32_t send_buf_id = sbuf->buff_id_list[machine_id]->front();
+      sbuf->buff_id_list[machine_id]->pop_front();
+      uint32_t *ptr = (uint32_t *)sbuf->buffer[machine_id][send_buf_id];
+      while (rbuf->release_id_list[machine_id]->size() > 0) {
+        uint32_t release_id = rbuf->release_id_list[machine_id]->front();
+        rbuf->release_id_list[machine_id]->pop_front();
+        if (release_id >= MAX_WRITE_NUM) {
+          fprintf(stderr,
+          "FATAL [get_write_send_buf]: release_id %u >= MAX_WRITE_NUM %d, aborting\n",
+          release_id, MAX_WRITE_NUM);
+          abort();
+        }
+        ptr[num + 1] = release_id;
+        num++;
+      }
+      ptr[0] = num;
+      post_write_send(machine_id, send_buf_id, (num + 1) * 4, RELEASE);
+      }
       // reserve buffer for release write send
     } while (sbuf->buff_id_list[machine_id]->size() <= RELEASE_BLOCK);
   } else {
@@ -1140,19 +1199,19 @@ int RdmaCommunication::get_write_send_buf(
     }
   }
   uint32_t buf_id = sbuf->buff_id_list[machine_id]->front();
+  if (buf_id >= MAX_WRITE_NUM) {
+    fprintf(stderr,
+    "FATAL [get_write_send_buf]: buf_id %u >= MAX_WRITE_NUM %d for m%d, aborting\n",
+    buf_id, MAX_WRITE_NUM, machine_id);
+    abort();
+  }
   if (pop) {  // If not in clear state.
     sbuf->buff_id_list[machine_id]->pop_front();
-    // printf(
-    //     "sbuf pop ==> %d left size %d\n", buf_id,
-    //     sbuf->buff_id_list[machine_id]->size());
   } else {
     // move form front to back
     sbuf->buff_id_list[machine_id]->pop_front();
     sbuf->buff_id_list[machine_id]->push_back(buf_id);
   }
-  // printf(
-  //     "get %d. left size %d\n", buf_id,
-  //     sbuf->buff_id_list[machine_id]->size());
   return buf_id;
 }
 
@@ -1160,16 +1219,21 @@ int RdmaCommunication::post_write_send(
     int machine_id, uint32_t buf_id, uint32_t size, ControlType control) {
   auto *ctx = rdma_ctx.getLocal();
 
+  if (buf_id >= MAX_WRITE_NUM) {
+    fprintf(stderr,
+    "FATAL [post_write_send]: buf_id %u >= MAX_WRITE_NUM %d (m%d control %d size %u), aborting\n",
+    buf_id, MAX_WRITE_NUM, machine_id, control, size);
+    abort();
+  }
   size_t offset = MAX_QUERYBUFFER_SIZE * buf_id;
-// printf(
-//     "[post send write] m %d, buf %d, size %d, control %d\n", machine_id,
-//     buf_id, size, control);
 #ifdef COMM_PROFILE
   ctx->write_size += size;
   ctx->write_cnt++;
 #endif
   if (size > MAX_QUERYBUFFER_SIZE) {
-    printf("Error: Exceed the max write buffer size.\n");
+    fprintf(stderr,
+      "FATAL [post_write_send]: size %u > MAX_QUERYBUFFER_SIZE %u (m%d buf %u control %d), aborting\n",
+      size, MAX_QUERYBUFFER_SIZE, machine_id, buf_id, control);
     abort();
   }
   if (ctx->run_post_write_send(

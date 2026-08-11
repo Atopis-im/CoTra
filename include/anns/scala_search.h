@@ -406,7 +406,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
           printf("\n");
           abort();
         }
-        rdma_comm.release_cache(r.buffer_id);
+        rdma_comm.release_cache(r.buffer_id, r.owner_thread);
         // printf(" %d", r.buffer_id);
       }
       // printf("\n");
@@ -1515,7 +1515,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
             */
             if (buff_id != -1) {
               // if not local vector.
-              rdma_comm.release_cache(buff_id);
+              rdma_comm.release_cache(buff_id, ThreadPool::getTID());
             }
           }
 
@@ -1547,7 +1547,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
             query.top_candidates.pop();
             if (buff_id != -1) {
               // if not local vector.
-              rdma_comm.release_cache(buff_id);
+              rdma_comm.release_cache(buff_id, ThreadPool::getTID());
             }
           }
 
@@ -1555,7 +1555,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
             query.lowerBound = query.top_candidates.top().dist;
         } else {
           // Case2 : release cache buffer.
-          rdma_comm.release_cache(r.buffer_id);
+          rdma_comm.release_cache(r.buffer_id, r.owner_thread);
         }
       }
     }
@@ -1564,7 +1564,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
       VectorCache<dist_t> rez = query.top_candidates.top();
       query.top_candidates.pop();
       if (rez.buffer_id != -1) {
-        rdma_comm.release_cache(rez.buffer_id);
+        rdma_comm.release_cache(rez.buffer_id, ThreadPool::getTID());
       }
     }
 
@@ -1574,7 +1574,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
           std::pair<dist_t, labeltype>(rez.dist, get_element_label(rez.ptr)));
       query.top_candidates.pop();
       if (rez.buffer_id != -1) {
-        rdma_comm.release_cache(rez.buffer_id);
+        rdma_comm.release_cache(rez.buffer_id, ThreadPool::getTID());
       }
     }
 
@@ -2284,7 +2284,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
 
       for (uint32_t m = 0; m < MACHINE_NUM; m++) {
         float ratio_m = (float)global_query[query_id]->filter_num[m] / su_cnt;
-        if (ratio_m > 1.0 / (MACHINE_NUM)) {  // core machine ratio bar.
+        if (ratio_m >= 1.0 / (MACHINE_NUM)) {  // core machine ratio bar.
           global_query[query_id]->core_machine.emplace_back(m);
           global_query[query_id]->is_core_machine[m] = 1;
         } else {
@@ -2295,7 +2295,12 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
           }
         }
       }
-
+      // Ensure at least one core machine exists to prevent deadlock when
+      // candidates are evenly distributed (each machine has exactly 1/N ratio).
+      if (global_query[query_id]->core_machine.empty()) {
+        global_query[query_id]->core_machine.emplace_back(mx_mid);
+        global_query[query_id]->is_core_machine[mx_mid] = 1;
+      }
       // Dispatch sub-query: fork query to core machine.
       bool local_is_core = false;
       for (uint32_t &m : global_query[query_id]->core_machine) {
@@ -2617,7 +2622,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
                     global_query[query_id]->vector, vec_ptr, dist_func_param_);
                 post_proc_candidate(dist, ngh_id);
               }
-              rdma_comm.release_cache(r.buffer_id);
+              rdma_comm.release_cache(r.buffer_id, r.owner_thread);
               // free(r);
               recv_cnt++;
               // tman.rpost_async++;

@@ -80,6 +80,21 @@ class TaskManager {
   void serialize_task(uint32_t machine_id, char* ptr, uint64_t& offset = 0) {
     assert(machine_id != local_id);
 
+    // Pre-write size check to prevent buffer overflow.
+    // ComputeTask: machine_id(4)+qid(4)+deg(4)+offset(8)+lower_bound(dist_t)+ef_fill(1)+core_cnt(1)+nocore_cnt(1)
+    // NodeTask: machine_id(4)+qid(4)+node_id(4)+is_core_machine(4*MACHINE_NUM)
+    constexpr size_t task_header = sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint32_t) * 2 + 3;
+    constexpr size_t node_header = sizeof(uint32_t) * 3 + sizeof(uint32_t) * MACHINE_NUM;
+    size_t est_total = sizeof(local_id) + sizeof(uint32_t) * 2 +
+                    task_queue[machine_id].size() * (task_header + sizeof(dist_t)) +
+                    node_task_queue[machine_id].size() * node_header;
+    if (offset + est_total > MAX_QUERYBUFFER_SIZE) {
+      printf("FATAL [serialize_task]: would exceed buffer. est=%zu ofs=%llu cap=%u tasks=%zu node_tasks=%zu\n",
+      est_total, (unsigned long long)offset, MAX_QUERYBUFFER_SIZE,
+      task_queue[machine_id].size(), node_task_queue[machine_id].size());
+      abort();
+    }
+
     // Local id to inform remote machine.
     memcpy(ptr + offset, &local_id, sizeof(local_id));
     offset += sizeof(local_id);
@@ -99,10 +114,6 @@ class TaskManager {
       t.serialize(ptr, offset);
     }
 
-    if (offset > MAX_QUERYBUFFER_SIZE) {
-      printf("Error: task buffer size exceed limit.\n");
-      abort();
-    }
     return;
   }
 
@@ -151,15 +162,8 @@ class TaskManager {
 
     for (ResultMsg<dist_t>& r : result_queue[machine_id]) {
       r.serialize(ptr, offset);
-      if (offset >= MAX_QUERYBUFFER_SIZE) {
-        printf("Error: BUFFER size large than limit.\n");
-        printf(
-            "mid: %llu size %llu offset: %llu\n", machine_id,
-            result_queue[machine_id].size(), offset);
-        abort();
-      }
+      // ResultMsg::serialize has a pre-write check that aborts on overflow.
     }
-    assert(offset <= MAX_QUERYBUFFER_SIZE);
     return;
   }
 
@@ -209,15 +213,8 @@ class TaskManager {
 
     for (NodeResult<dist_t>& r : node_result_queue[machine_id]) {
       r.serialize(ptr, offset);
-      if (offset >= MAX_QUERYBUFFER_SIZE) {
-        printf("Error: BUFFER size large than limit.\n");
-        printf(
-            "mid: %llu size %llu offset: %llu\n", machine_id,
-            node_result_queue[machine_id].size(), offset);
-        abort();
-      }
+      // NodeResult::serialize has a pre-write check that aborts on overflow.
     }
-    assert(offset <= MAX_QUERYBUFFER_SIZE);
     return;
   }
 
@@ -265,15 +262,8 @@ class TaskManager {
 
     for (NonCoreSyncMsg<dist_t>& msg : noncore_sync_msg[machine_id]) {
       msg.serialize(ptr, offset);
-      if (offset >= MAX_QUERYBUFFER_SIZE) {
-        printf("Error: BUFFER size large than limit.\n");
-        printf(
-            "mid: %llu size %llu offset: %llu\n", machine_id,
-            noncore_sync_msg[machine_id].size(), offset);
-        abort();
-      }
+      // NonCoreSyncMsg::serialize has a pre-write check that aborts on overflow.
     }
-    assert(offset <= MAX_QUERYBUFFER_SIZE);
     return;
   }
 

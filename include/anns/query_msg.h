@@ -218,6 +218,26 @@ class QueryMsg {
 
   // New Serialization function, without visit list.
   size_t serialize2(void* dest) {
+    // Pre-write size estimation to prevent buffer overflow.
+    size_t est = sizeof(ef) + sizeof(query_id) + sizeof(origin_machine) +
+              sizeof(current_node_id) + sizeof(lowerBound) +
+              sizeof(vector_size) + vector_size + sizeof(state) +
+              sizeof(path_cnt) + sizeof(max_path_id) +
+              sizeof(max_path_cnt) + sizeof(path_length) +
+              sizeof(leader_machine);
+    est += sizeof(size_t) + core_machine.size() * sizeof(uint32_t);
+    est += sizeof(size_t) + top_candidates.size() * sizeof(std::pair<dist_t, uint32_t>);
+    // candidate_set (filtered by lowerBound, use full size as upper bound)
+    est += sizeof(size_t) + candidate_set.size() * sizeof(std::pair<dist_t, uint32_t>);
+    // result
+    est += sizeof(size_t) + result.size() * sizeof(std::pair<dist_t, labeltype>);
+    if (est > MAX_QUERYBUFFER_SIZE) {
+      printf("FATAL [QueryMsg::serialize2]: q%u would exceed buffer. est=%zu cap=%u vec_size=%zu top=%zu cand=%zu res=%zu\n",
+      query_id, est, MAX_QUERYBUFFER_SIZE, vector_size,
+      top_candidates.size(), candidate_set.size(), result.size());
+      abort();
+    }
+ 
     size_t offset = 0;
     memcpy(static_cast<char*>(dest) + offset, &ef, sizeof(ef));
     offset += sizeof(ef);
@@ -354,6 +374,29 @@ class QueryMsg {
    * Fork QueryMsg in different core machines.
    */
   size_t fork(uint32_t machine_id, void* dest) {
+    // Pre-write size estimation to prevent buffer overflow.
+    // Header: ef+qid+origin+current_node+lowerBound+vector_size+state+path fields+leader
+    size_t est = sizeof(ef) + sizeof(query_id) + sizeof(origin_machine) +
+                sizeof(current_node_id) + sizeof(lowerBound) +
+                sizeof(vector_size) + vector_size + sizeof(state) +
+                sizeof(path_cnt) + sizeof(max_path_id) +
+                sizeof(max_path_cnt) + sizeof(path_length) +
+                sizeof(leader_machine);
+    // core_machine list
+    est += sizeof(size_t) + core_machine.size() * sizeof(uint32_t);
+    // top_candidates
+    est += sizeof(size_t) + top_candidates.size() * sizeof(std::pair<dist_t, uint32_t>);
+    // filterred[machine_id]
+    est += sizeof(size_t) + filterred[machine_id].size() * sizeof(std::pair<dist_t, uint32_t>);
+    // result
+    est += sizeof(size_t) + result.size() * sizeof(std::pair<dist_t, labeltype>);
+    if (est > MAX_QUERYBUFFER_SIZE) {
+      printf("FATAL [QueryMsg::fork]: q%u would exceed buffer. est=%zu cap=%u vec_size=%zu top=%zu filt=%zu res=%zu\n",
+      query_id, est, MAX_QUERYBUFFER_SIZE, vector_size,
+      top_candidates.size(), filterred[machine_id].size(), result.size());
+      abort();
+    }
+ 
     size_t offset = 0;
     memcpy(static_cast<char*>(dest) + offset, &ef, sizeof(ef));
     offset += sizeof(ef);
@@ -454,10 +497,6 @@ class QueryMsg {
     }
 
     assert(offset <= MAX_QUERYBUFFER_SIZE);
-    if (offset > MAX_QUERYBUFFER_SIZE) {
-      printf("Error: exceed buffer size.\n");
-      abort();
-    }
     return offset;
   }
 

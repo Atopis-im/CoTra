@@ -104,6 +104,24 @@ struct SyncMsg {
   }
 
   size_t serialize(char* ptr) {
+    // Pre-write size estimation to prevent buffer overflow.
+    size_t est = sizeof(qid) + sizeof(update_term) + sizeof(has_token) +
+              sizeof(token_is_black) + sizeof(proc_is_black) +
+              sizeof(last_is_white) + sizeof(lower_bound);
+    // local_add_cand (filtered, use full size as upper bound)
+    est += sizeof(uint32_t) + local_add_cand.size() * sizeof(std::pair<dist_t, uint32_t>);
+    // core ngh arrays
+    for (uint32_t i = 0; i < MACHINE_NUM; i++) {
+      est += sizeof(uint32_t) * 2;
+      est += core_micro_ngh[i].size() * sizeof(uint32_t);
+      est += core_large_ngh[i].size() * sizeof(std::pair<size_t, uint32_t>);
+    }
+    if (est > MAX_QUERYBUFFER_SIZE) {
+      printf("FATAL [SyncMsg::serialize]: q%u would exceed buffer. est=%zu cap=%u local_cand=%zu\n",
+      qid, est, MAX_QUERYBUFFER_SIZE, local_add_cand.size());
+      abort();
+    }
+ 
     size_t offset = 0;
     memcpy(ptr + offset, &qid, sizeof(qid));
     offset += sizeof(qid);
@@ -151,15 +169,7 @@ struct SyncMsg {
       for (std::pair<size_t, uint32_t>& elem : core_large_ngh[i]) {
         memcpy(ptr + offset, &elem, sizeof(elem));
         offset += sizeof(elem);
-        // printf("emplace-sync %llu %u\n", elem.first, elem.second);
       }
-      // printf(
-      //     "send to q%u sync task size %u, %u, ofs %llu\n", qid, size2, size3,
-      //     offset);
-    }
-    if (offset >= MAX_QUERYBUFFER_SIZE) {
-      printf("Error: sync msg exceed buffer size\n");
-      abort();
     }
     return offset;
   }
@@ -198,14 +208,23 @@ struct ResultMsg {
         (std::pair<dist_t, uint32_t>*)(ptr + offset);
     // printf("dese res size %u\n", res_size);
     for (uint32_t i = 0; i < res_size; i++) {
-      // printf("dist %llu, id %u\n", res_ptr[i].first, res_ptr[i].second);
-      res.emplace_back(res_ptr[i]);
+      std::pair<dist_t, uint32_t> r;
+      memcpy(&r, ptr + offset, sizeof(r));   // 原来是 res_ptr[i] 指针强转
+      res.emplace_back(r);
       offset += sizeof(std::pair<dist_t, uint32_t>);
     }
     // printf("dese res size over\n");
   }
 
   void serialize(char* ptr, uint64_t& offset = 0) {
+    // ResultMsg header: qid(4) + core_cnt(1) + nocore_cnt(1) + res_size(4)
+    // = 10 bytes. Use 4 uint32s = 16 as a safe over-estimate.
+    size_t total = sizeof(uint32_t) * 4 + res.size() * sizeof(std::pair<dist_t, uint32_t>);
+    if (offset + total > MAX_QUERYBUFFER_SIZE) {
+      printf("Error: Result Msg q%u res_size=%zu total=%zu would exceed buffer (ofs=%llu cap=%u), aborting.\n",
+      qid, res.size(), total, (unsigned long long)offset, MAX_QUERYBUFFER_SIZE);
+      abort();
+    }
     // Local id to inform remote machine.
     memcpy(ptr + offset, &qid, sizeof(qid));
     offset += sizeof(qid);
@@ -219,16 +238,11 @@ struct ResultMsg {
     memcpy(ptr + offset, &res_size, sizeof(res_size));
     offset += sizeof(res_size);
 
-    // printf("res.size() %u\n", res.size());
     for (std::pair<dist_t, uint32_t>& r : res) {
       memcpy(ptr + offset, &r, sizeof(r));
       offset += sizeof(r);
     }
-    // printf("ofs: %llu\n", offset);
-    if (offset > MAX_QUERYBUFFER_SIZE) {
-      printf("Error: Result Msg exceed buffer size\n");
-      abort();
-    }
+
   }
 };
 
@@ -404,14 +418,22 @@ struct NodeResult {
         (std::pair<dist_t, uint32_t>*)(ptr + offset);
     // printf("dese res size %u\n", res_size);
     for (uint32_t i = 0; i < res_size; i++) {
-      // printf("dist %llu, id %u\n", res_ptr[i].first, res_ptr[i].second);
-      res.emplace_back(res_ptr[i]);
+      std::pair<dist_t, uint32_t> r;
+      memcpy(&r, ptr + offset, sizeof(r));   // 原来是 res_ptr[i] 指针强转
+      res.emplace_back(r);
       offset += sizeof(std::pair<dist_t, uint32_t>);
     }
     // printf("dese res size over\n");
   }
 
   void serialize(char* ptr, uint64_t& offset = 0) {
+    // NodeResult header: qid(4) + post_cnt(4) + res_size(4) = 12 bytes (3 uint32s).
+    size_t total = sizeof(uint32_t) * 3 + res.size() * sizeof(std::pair<dist_t, uint32_t>);
+    if (offset + total > MAX_QUERYBUFFER_SIZE) {
+      printf("Error: NodeResult Msg q%u res_size=%zu total=%zu would exceed buffer (ofs=%llu cap=%u), aborting.\n",
+      qid, res.size(), total, (unsigned long long)offset, MAX_QUERYBUFFER_SIZE);
+      abort();
+    }
     // Local id to inform remote machine.
     memcpy(ptr + offset, &qid, sizeof(qid));
     offset += sizeof(qid);
@@ -423,15 +445,9 @@ struct NodeResult {
     memcpy(ptr + offset, &res_size, sizeof(res_size));
     offset += sizeof(res_size);
 
-    // printf("res.size() %u\n", res.size());
     for (std::pair<dist_t, uint32_t>& r : res) {
       memcpy(ptr + offset, &r, sizeof(r));
       offset += sizeof(r);
-    }
-    // printf("ofs: %llu\n", offset);
-    if (offset > MAX_QUERYBUFFER_SIZE) {
-      printf(
-          "Error: NodeResult Msg exceed buffer size, res_size: %u\n", res_size);
     }
   }
 };
@@ -487,6 +503,17 @@ struct NonCoreSyncMsg {
   }
 
   size_t serialize(char* ptr, size_t& offset) {
+    // Pre-write size check.
+    size_t est = sizeof(qid) + sizeof(uint32_t) * 2 +
+              core_micro_ngh.size() * sizeof(uint32_t) +
+              core_large_ngh.size() * sizeof(std::pair<size_t, uint32_t>);
+    if (offset + est > MAX_QUERYBUFFER_SIZE) {
+      printf("FATAL [NonCoreSyncMsg::serialize]: q%u would exceed buffer. est=%zu ofs=%zu cap=%u micro=%zu large=%zu\n",
+      qid, est, offset, MAX_QUERYBUFFER_SIZE,
+      core_micro_ngh.size(), core_large_ngh.size());
+      abort();
+    }
+ 
     memcpy(ptr + offset, &qid, sizeof(qid));
     offset += sizeof(qid);
 
@@ -505,14 +532,6 @@ struct NonCoreSyncMsg {
     for (std::pair<size_t, uint32_t>& elem : core_large_ngh) {
       memcpy(ptr + offset, &elem, sizeof(elem));
       offset += sizeof(elem);
-      // printf("emplace-sync %llu %u\n", elem.first, elem.second);
-    }
-    // printf(
-    //     "send to q%u sync task size %u, %u, ofs %llu\n", qid, size2, size3,
-    //     offset);
-    if (offset >= MAX_QUERYBUFFER_SIZE) {
-      printf("Error: Non-core node sync msg exceed buffer size\n");
-      abort();
     }
     return offset;
   }
@@ -632,6 +651,7 @@ struct BufferCache {
   uint64_t internal_id;
   int buffer_id;
   char* buffer_ptr;
+  uint32_t owner_thread{0};
   BufferCache() {}
 
   BufferCache(
@@ -650,6 +670,7 @@ struct VectorCache {
   uint64_t vector_id;
   int buffer_id;  // -1 means local buffer or not dispatch.
   char* ptr;
+  uint32_t owner_thread{0};
 };
 
 // TODO: ReadBuffer
