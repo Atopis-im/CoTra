@@ -140,22 +140,22 @@ class RdmaCommunication {
     poll_send();
     poll_recv();
 
-    // [DEBUG] Periodic poll_task_result state dump
-    {
-      static thread_local uint64_t _dbg_ptr_cnt = 0;
-      _dbg_ptr_cnt++;
-      if (_dbg_ptr_cnt % 1000000 == 1) {
-        printf("[DBG-PTR][T%u] recv_task=%zu recv_res=%zu recv_node_res=%zu "
-               "recv_node_sync=%zu recv_compute=%zu migrate=%zu "
-               "core_info=%zu sync=%zu async_read=%zu\n",
-               (unsigned)ThreadPool::getTID(),
-               rbuf->recv_task.size(), rbuf->recv_result.size(),
-               rbuf->recv_node_res.size(), rbuf->recv_node_sync.size(),
-               rbuf->recv_compute.size(), rbuf->migrate_queue.size(),
-               rbuf->core_info_queue.size(), rbuf->sync_queue.size(),
-               rd_buf->recv_list.size());
-      }
-    }
+    // // [DEBUG] Periodic poll_task_result state dump
+    // {
+    //   static thread_local uint64_t _dbg_ptr_cnt = 0;
+    //   _dbg_ptr_cnt++;
+    //   if (_dbg_ptr_cnt % 1000000 == 1) {
+    //     printf("[DBG-PTR][T%u] recv_task=%zu recv_res=%zu recv_node_res=%zu "
+    //            "recv_node_sync=%zu recv_compute=%zu migrate=%zu "
+    //            "core_info=%zu sync=%zu async_read=%zu\n",
+    //            (unsigned)ThreadPool::getTID(),
+    //            rbuf->recv_task.size(), rbuf->recv_result.size(),
+    //            rbuf->recv_node_res.size(), rbuf->recv_node_sync.size(),
+    //            rbuf->recv_compute.size(), rbuf->migrate_queue.size(),
+    //            rbuf->core_info_queue.size(), rbuf->sync_queue.size(),
+    //            rd_buf->recv_list.size());
+    //   }
+    // }
     // Collect recved tasks.
     while (rbuf->recv_task.size() > 0) {
 #ifdef PROFILER

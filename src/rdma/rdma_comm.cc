@@ -768,15 +768,15 @@ int RdmaCommunication::poll_recv() {
     abort();
   }
 
-    // [DEBUG] Periodic log when CQ is empty
-  {
-    static thread_local uint64_t _dbg_poll_cnt = 0;
-    _dbg_poll_cnt++;
-    if (_dbg_poll_cnt % 1000000 == 0) {
-      printf("[DBG-POLL][T%u] recv_cq ne=%d total_polls=%lu\n",
-             ThreadPool::getTID(), ne, _dbg_poll_cnt);
-    }
-  }
+  // // [DEBUG] Periodic log when CQ is empty
+  // {
+  //   static thread_local uint64_t _dbg_poll_cnt = 0;
+  //   _dbg_poll_cnt++;
+  //   if (_dbg_poll_cnt % 1000000 == 0) {
+  //     printf("[DBG-POLL][T%u] recv_cq ne=%d total_polls=%lu\n",
+  //            ThreadPool::getTID(), ne, _dbg_poll_cnt);
+  //   }
+  // }
 
   if (ne > 0) {
     // printf("ne: %d\n", ne);

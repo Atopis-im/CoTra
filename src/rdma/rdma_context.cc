@@ -602,16 +602,16 @@ int RdmaContext::run_post_write_send(
   wwr[machine_id][buf_id].num_sge = MAX_SEND_SGE;
   wwr[machine_id][buf_id].imm_data = htonl(control);
 
-  // [DEBUG] Periodic log for RDMA write sends
-  static thread_local uint64_t _dbg_send_cnt = 0;
-  _dbg_send_cnt++;
-  if (_dbg_send_cnt <= 20 || _dbg_send_cnt % 50000 == 0) {
-    printf("[DBG-SEND][T%u] m%d buf%u size%u ctrl=%u remote_addr=%lx vaddr_base=%lx\n",
-           ThreadPool::getTID(), machine_id, buf_id, size,
-           control >> 16,
-           wwr[machine_id][buf_id].wr.rdma.remote_addr,
-           remote_mr_msg[machine_id].write_vaddr);
-  }
+  // // [DEBUG] Periodic log for RDMA write sends
+  // static thread_local uint64_t _dbg_send_cnt = 0;
+  // _dbg_send_cnt++;
+  // if (_dbg_send_cnt <= 20 || _dbg_send_cnt % 50000 == 0) {
+  //   printf("[DBG-SEND][T%u] m%d buf%u size%u ctrl=%u remote_addr=%lx vaddr_base=%lx\n",
+  //          ThreadPool::getTID(), machine_id, buf_id, size,
+  //          control >> 16,
+  //          wwr[machine_id][buf_id].wr.rdma.remote_addr,
+  //          remote_mr_msg[machine_id].write_vaddr);
+  // }
 
   struct ibv_send_wr *bad_wr = NULL;
   int err = ibv_post_send(qp[machine_id], &wwr[machine_id][buf_id], &bad_wr);
