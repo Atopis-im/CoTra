@@ -1593,10 +1593,15 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
     float avg_lat = rdma_comm.query_lat_sum / rdma_comm.query_load;
     size_t all_comp_cnt = rdma_comm.all_computation_cnt;
     float qps = 1000000.0 * rdma_comm.query_load / time;
-    // printf("-------------- Overall info --------------\n");
-    // printf(
-    //     "correct: %llu total: %llu query load: %llu\n", rdma_comm.correct,
-    //     rdma_comm.total, rdma_comm.query_load);
+    static bool header_printed = false;
+    if (!header_printed) {
+#ifdef PROF_COMPUTATION
+      printf("ef \t recall \t avg_lat(us) \t qps \t comp_cnt\n");
+#else
+      printf("ef \t recall \t avg_lat(us) \t qps\n");
+#endif
+      header_printed = true;
+    }
 #ifdef PROF_COMPUTATION
     printf(
         "%d \t %.5f \t %.2f \t %.3f \t %llu \n", ef_, recall, avg_lat,

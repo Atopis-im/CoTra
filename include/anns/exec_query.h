@@ -671,6 +671,11 @@ static void test_vs_recall(
           float recall = 1.0f * correct.load() / total.load();
           float time_us_per_query = exec_time / query_load;
           float qps = 1000000.0 * query_load / exec_time;
+          static bool header_printed = false;
+          if (!header_printed) {
+            cout << "ef" << "\t" << "recall" << "\t" << "time_per_query(us)" << "\t" << "qps" << "\n";
+            header_printed = true;
+          }
           cout << ef << "\t" << recall << "\t" << time_us_per_query << " us\t"
               << qps << " /s\n";
         }
