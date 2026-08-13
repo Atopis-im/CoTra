@@ -15,7 +15,7 @@
 // #define PROF_Q_DISTRI
 // #define PROF_ALL_Q_DISTRI
 
-// #define LAT
+#define LAT
 // #define PROFILER
 // #define COMM_PROFILE
 

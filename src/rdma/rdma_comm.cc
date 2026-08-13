@@ -1326,6 +1326,7 @@ void RdmaCommunication::send_term(
       correct += q_correct;
       total += q_total;
       query_load += q_query_load;
+      query_lat_sum += cumu_lat_us;
       continue;
     }
     uint32_t buf_id = get_write_send_buf(m);
