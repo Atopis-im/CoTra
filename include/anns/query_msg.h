@@ -138,6 +138,12 @@ class QueryMsg {
 
   std::priority_queue<std::pair<dist_t, size_t>> result;
 
+  // Stage timing (microseconds)
+  uint64_t pre_stage_us{0};   // PRE_STAGE: routing + dispatch
+  uint64_t post_stage_us{0};  // POST_STAGE: main search loop
+  uint64_t term_us{0};        // TERMINATION: token passing
+  std::chrono::high_resolution_clock::time_point stage_tp;
+
   QueryMsg() {}
   ~QueryMsg() {}
 

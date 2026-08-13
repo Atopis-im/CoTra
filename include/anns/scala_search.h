@@ -2181,6 +2181,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
       printf("start new query %u, Pre STAGE\n", query_id);
 #endif
       global_query[query_id]->state = PRE_STAGE;
+      global_query[query_id]->stage_tp = std::chrono::high_resolution_clock::now();
 
 #ifdef PROFILER
       global_query[query_id]->profiler.start("q_pre-stage");
@@ -2337,6 +2338,14 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
 #ifdef PROFILER
       global_query[query_id]->profiler.end("q_pre-stage");
 #endif
+      // Record PRE_STAGE duration
+      {
+        auto now = std::chrono::high_resolution_clock::now();
+        global_query[query_id]->pre_stage_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                now - global_query[query_id]->stage_tp).count();
+        global_query[query_id]->stage_tp = now;
+      }
 
       if (!local_is_core) {
 #ifdef DEBUG
@@ -2359,6 +2368,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
       printf("recv fork sub-query q%u\n", query_id);
 #endif
       global_query[query_id]->state = PRE_STAGE;
+      global_query[query_id]->stage_tp = std::chrono::high_resolution_clock::now();
     }
 
     // if local machine is core machine.
@@ -2679,6 +2689,14 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
 
         // local termination, prop token
         // printf("q%u start term\n", query_id);
+        // Record POST_STAGE duration, start TERMINATION timer
+        {
+          auto now = std::chrono::high_resolution_clock::now();
+          global_query[query_id]->post_stage_us +=
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  now - global_query[query_id]->stage_tp).count();
+          global_query[query_id]->stage_tp = now;
+        }
         if (global_query[query_id]->core_machine.size() > 1) {
           if (global_query[query_id]->has_token) {
             // if is leader
@@ -2715,6 +2733,13 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
             global_query[query_id]->sync_step = 0;
           }
           global_query[query_id]->state = PAUSE;
+          // Record TERMINATION duration up to PAUSE point
+          {
+            auto now = std::chrono::high_resolution_clock::now();
+            global_query[query_id]->term_us +=
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    now - global_query[query_id]->stage_tp).count();
+          }
           // printf("q%u search PAUSE\n", query_id);
         } else {
           // single core machine, just end.
@@ -2725,6 +2750,13 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
       }
     }
     // printf("search END\n");
+    // Record TERMINATION duration
+    {
+      auto now = std::chrono::high_resolution_clock::now();
+      global_query[query_id]->term_us +=
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              now - global_query[query_id]->stage_tp).count();
+    }
     global_query[query_id]->state = END;
 // printf("q%d over\n", query->query_id);
 #ifdef DEBUG
@@ -2947,6 +2979,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
           // printf("voke q%u\n", res_msg.qid);
           subquery_queue.push_back(res_msg.qid);
           global_query[res_msg.qid]->state = POST_STAGE;
+          global_query[res_msg.qid]->stage_tp = std::chrono::high_resolution_clock::now();
         }
       }
       node_res_queue.clear();
@@ -3134,6 +3167,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
             // printf("voke q%u\n", res_msg.qid);
             subquery_queue.push_back(res_msg.qid);
             global_query[res_msg.qid]->state = POST_STAGE;
+            global_query[res_msg.qid]->stage_tp = std::chrono::high_resolution_clock::now();
           }
           // printf("push q%u post-stage res over\n", res_msg.qid);
         }

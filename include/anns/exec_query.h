@@ -496,6 +496,9 @@ static void test_vs_recall(
         RangeIterator all(query_load);
         on_each(all);
         std::atomic<size_t> load_cnt(0);
+        // Stage timing accumulators (atomic, accessed from multiple threads)
+        std::atomic<uint64_t> sum_pre_us(0), sum_post_us(0), sum_term_us(0);
+        std::atomic<size_t> stage_cnt(0);
 #ifdef LAT
         // for latency record
         std::chrono::high_resolution_clock::time_point start[qsize];
@@ -573,6 +576,11 @@ static void test_vs_recall(
             res->profiler.report();
 #endif
 #endif
+            // Accumulate stage timing (before delete)
+            sum_pre_us.fetch_add(res->pre_stage_us, std::memory_order_relaxed);
+            sum_post_us.fetch_add(res->post_stage_us, std::memory_order_relaxed);
+            sum_term_us.fetch_add(res->term_us, std::memory_order_relaxed);
+            stage_cnt.fetch_add(1, std::memory_order_relaxed);
             delete res;
             load_cnt.fetch_add(1);
             // printf("load_cnt ++: %u\n", load_cnt.load());
@@ -645,6 +653,19 @@ static void test_vs_recall(
 #ifdef COMM_PROFILE
                 appr_alg.report_comm_info(exec_time);
 #endif
+                // Print stage timing breakdown
+                if (stage_cnt.load() > 0) {
+                  double avg_pre = (double)sum_pre_us.load() / stage_cnt.load();
+                  double avg_post = (double)sum_post_us.load() / stage_cnt.load();
+                  double avg_term = (double)sum_term_us.load() / stage_cnt.load();
+                  double avg_total = avg_pre + avg_post + avg_term;
+                  printf("-------------- Stage Timing (avg per query, cnt=%zu) --------------\n", stage_cnt.load());
+                  printf("  PRE_STAGE  (routing+dispatch): %.2f us  (%.1f%%)\n", avg_pre, avg_pre * 100.0 / avg_total);
+                  printf("  POST_STAGE (main search)     : %.2f us  (%.1f%%)\n", avg_post, avg_post * 100.0 / avg_total);
+                  printf("  TERMINATION(token passing)   : %.2f us  (%.1f%%)\n", avg_term, avg_term * 100.0 / avg_total);
+                  printf("  TOTAL                        : %.2f us\n", avg_total);
+                  printf("------------------------  End  ------------------------\n");
+                }
                 if (appr_alg.rdma_param.machine_id == 0) {
                   if (anns_param.evaluation_save_path.empty()) {
                     appr_alg.printQueryBatchInfo(exec_time);
