@@ -54,7 +54,13 @@ endif()
 
 add_compile_options(
   $<$<CONFIG:Release>:-O3>
+  $<$<CONFIG:Release>:-g>
   $<$<CONFIG:Debug>:-g>)
+
+# Export symbols so backtrace_symbols_fd can resolve addresses in the
+# main executable (otherwise only shared-lib frames get symbol names).
+add_link_options($<$<CONFIG:Release>:-rdynamic>
+                 $<$<CONFIG:Debug>:-rdynamic>)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules")
 

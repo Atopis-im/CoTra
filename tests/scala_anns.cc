@@ -5,13 +5,36 @@
 #include <execinfo.h>
 #include <cstdlib>
 #include <unistd.h>
+#include <dlfcn.h>
+#include <cxxabi.h>
+
+static void print_frame(void *addr, int idx) {
+  Dl_info info;
+  memset(&info, 0, sizeof(info));
+  const char *sym_name = "??";
+  const char *file_name = "??";
+  char *demangled = nullptr;
+  if (dladdr(addr, &info)) {
+    if (info.dli_sname) {
+      int status = 0;
+      demangled = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &status);
+      sym_name = (demangled && status == 0) ? demangled : info.dli_sname;
+    }
+    if (info.dli_fname) file_name = info.dli_fname;
+  }
+  long offset = info.dli_saddr ? (char *)addr - (char *)info.dli_saddr : -1;
+  fprintf(stderr, "#%d %p  %s+0x%lx  (%s)\n",
+          idx, addr, sym_name, offset, file_name);
+  if (demangled) free(demangled);
+}
 
 static void crash_handler(int sig) {
   fprintf(stderr, "\n===== CRASH (signal %d) =====\n", sig);
   void *bt[64];
   int n = backtrace(bt, 64);
-  backtrace_symbols_fd(bt, n, STDERR_FILENO);
+  for (int i = 0; i < n; ++i) print_frame(bt[i], i);
   fprintf(stderr, "===== END BACKTRACE =====\n");
+  fprintf(stderr, "Resolve exact line with: addr2line -e build/tests/scala_anns -f -C <addr>\n");
   _exit(sig);
 }
 
@@ -20,6 +43,7 @@ int main(int argc, char **argv) {
   signal(SIGSEGV, crash_handler);
   signal(SIGABRT, crash_handler);
   signal(SIGFPE, crash_handler);
+  signal(SIGBUS, crash_handler);
   setbuf(stdout, NULL);
   setbuf(stderr, NULL);
 SharedMem coromem;
