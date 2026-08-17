@@ -1,8 +1,25 @@
 #include "anns/exec_query.h"
 #include "index/graph_index.h"
 
+#include <csignal>
+#include <execinfo.h>
+#include <cstdlib>
+#include <unistd.h>
+
+static void crash_handler(int sig) {
+  fprintf(stderr, "\n===== CRASH (signal %d) =====\n", sig);
+  void *bt[64];
+  int n = backtrace(bt, 64);
+  backtrace_symbols_fd(bt, n, STDERR_FILENO);
+  fprintf(stderr, "===== END BACKTRACE =====\n");
+  _exit(sig);
+}
+
 // ../scripts/scala_anns.sh
 int main(int argc, char **argv) {
+  signal(SIGSEGV, crash_handler);
+  signal(SIGABRT, crash_handler);
+  signal(SIGFPE, crash_handler);
   setbuf(stdout, NULL);
   setbuf(stderr, NULL);
 SharedMem coromem;
