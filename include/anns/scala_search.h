@@ -481,6 +481,8 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
     uint64_t all_write_size = 0;
     uint64_t all_read_cnt = 0;
     uint64_t all_write_cnt = 0;
+    uint64_t all_post_wr_us = 0;
+    uint64_t all_poll_cq_us = 0;
 
     for (uint32_t t = 0; t < getActiveThreads(); ++t) {
       auto *ctx = rdma_comm.rdma_ctx.getRemote(t);
@@ -488,15 +490,62 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
       all_write_size += ctx->write_size;
       all_read_cnt += ctx->read_cnt;
       all_write_cnt += ctx->write_cnt;
+      all_post_wr_us += ctx->post_wr_us;
+      all_poll_cq_us += ctx->poll_cq_us;
     }
     float read_sz_ps = 1000000.0 * (all_read_size >> 20) / time;
     float read_num_ps = 1000000.0 * all_read_cnt / time;
     float write_sz_ps = 1000000.0 * (all_write_size >> 20) / time;
     float write_num_ps = 1000000.0 * all_write_cnt / time;
-    printf("-------------- Overall COMM Info --------------\n");
-    printf("Read: %.2f MB/s, %.2f num/s\n", read_sz_ps, read_num_ps);
-    printf("Write: %.2f MB/s, %.2f num/s\n", write_sz_ps, write_num_ps);
-    printf("--------------------  End  --------------------\n");
+    uint64_t total_xfer_bytes = all_read_size + all_write_size;
+    float total_mb = (float)total_xfer_bytes / (1024.0f * 1024.0f);
+    float xfer_mbps = 1000000.0f * total_mb / time;
+    // Effective utilization vs a 100Gbps RoCE (theoretical ~11.9 GB/s usable = ~12190 MB/s)
+    // For 25Gbps use ~3000 MB/s, for 50Gbps use ~6000 MB/s as line ref.
+    const float ROCE_LINE_MBPS = 11500.0f;
+    float util_pct = 100.0f * xfer_mbps / ROCE_LINE_MBPS;
+    // Avg payload size per msg (small -> algo design issue; large -> good)
+    float avg_write_sz = all_write_cnt > 0 ? (float)all_write_size / all_write_cnt : 0;
+    float avg_read_sz  = all_read_cnt  > 0 ? (float)all_read_size  / all_read_cnt  : 0;
+
+    printf("-------------- COMM + RDMA Diagnostics --------------\n");
+    printf("Data transfer: total=%.2f MB,  rate=%.1f MB/s  (util=%.1f%% of 100G RoCE line)\n",
+           total_mb, xfer_mbps, util_pct);
+    printf(" Write: %.2f MB/s, %.1f ops/s, avg %.0f B/op\n",
+           write_sz_ps, write_num_ps, avg_write_sz);
+    printf(" Read : %.2f MB/s, %.1f ops/s, avg %.0f B/op\n",
+           read_sz_ps,  read_num_ps,  avg_read_sz);
+    // RDMA CPU-side overhead (post verbs + poll CQ) vs wall time
+    float t_sec = time * 1e-6f;
+    float nthread = (float)getActiveThreads();
+    float cpu_rdma_ms = (float)(all_post_wr_us + all_poll_cq_us) / 1000.0f;
+    float wall_ms = (float)time / 1000.0f;
+    printf("RDMA CPU overhead:  postWR=%.2f s  pollCQ=%.2f s  (sum=%.2f s across %u thrs)\n",
+           (float)all_post_wr_us / 1e6f, (float)all_poll_cq_us / 1e6f,
+           cpu_rdma_ms / 1000.0f, getActiveThreads());
+    // Derived diagnostics
+    printf("--- Diagnostic hints ---\n");
+    if (util_pct > 50.0f) {
+      printf(" [NET BOTTLENECK] util=%.1f%% is high: your RDMA fabric is near line rate.\n"
+             "   → Can't go faster without adding nodes / using a bigger pipe.\n", util_pct);
+    } else if (util_pct < 15.0f && (write_num_ps + read_num_ps) > 100000.0f) {
+      printf(" [ALGO: too many small msgs] util=%.1f%% low but msg/s=%.0f high.\n"
+             "   → Avg msg %.0f B is small (task push granularity too fine).\n"
+             "   → Try CAND_GROUP_SIZE++, batch more tasks per post_write_send.\n",
+             util_pct, write_num_ps + read_num_ps,
+             (avg_write_sz + avg_read_sz) / 2.0f);
+    } else if (util_pct < 15.0f) {
+      printf(" [COMPUTE BOTTLENECK likely] util=%.1f%% low AND msg/s not high.\n"
+             "   → CoTra is waiting more on local/remote distance computation than on RDMA.\n", util_pct);
+    }
+    float per_q_bytes = rdma_comm.query_load > 0 ? (float)total_xfer_bytes / rdma_comm.query_load : 0;
+    printf(" Per-query network foot-print: %.0f bytes (%.2f KB)\n",
+           per_q_bytes, per_q_bytes / 1024.0f);
+    // Small payload warning: if average < 256B, we're definitely dominated by per-op overhead
+    if (avg_write_sz > 0 && avg_write_sz < 512.0f) {
+      printf(" [WARNING] avg write msg %.0f B is tiny: RDMA per-op overhead dominates over data.\n", avg_write_sz);
+    }
+    printf("-------------------------  End  ------------------------\n");
   }
 
 

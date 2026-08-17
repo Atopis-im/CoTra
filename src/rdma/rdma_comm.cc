@@ -708,6 +708,7 @@ void RdmaCommunication::com_init(
  */
 int RdmaCommunication::poll_send() {
   auto *ctx = rdma_ctx.getLocal();
+  auto _t0 = std::chrono::high_resolution_clock::now();
 
   int ne = ctx->poll_SEND();
   if (ne < 0) {
@@ -752,6 +753,9 @@ int RdmaCommunication::poll_send() {
       // Update buffer list.
     }
   }
+  auto _t1 = std::chrono::high_resolution_clock::now();
+  ctx->poll_cq_us +=
+      std::chrono::duration_cast<std::chrono::microseconds>(_t1 - _t0).count();
   return ne;
 }
 
@@ -761,6 +765,7 @@ int RdmaCommunication::poll_send() {
 // TODO: optimize buffer replicate(copy) efficiency.
 int RdmaCommunication::poll_recv() {
   auto *ctx = rdma_ctx.getLocal();
+  auto _t0 = std::chrono::high_resolution_clock::now();
 
   int ne = ctx->poll_RECV();
   if (ne < 0) {
@@ -966,6 +971,9 @@ int RdmaCommunication::poll_recv() {
       // Update buffer list.
     }
   }
+  auto _t1 = std::chrono::high_resolution_clock::now();
+  ctx->poll_cq_us +=
+      std::chrono::duration_cast<std::chrono::microseconds>(_t1 - _t0).count();
   return ne;
 }
 
@@ -1057,6 +1065,7 @@ char *RdmaCommunication::sync_read(
 int RdmaCommunication::post_read(
     std::vector<BufferCache> &vectors, size_t vec_size, uint32_t query_id) {
   auto *ctx = rdma_ctx.getLocal();
+  auto _t0 = std::chrono::high_resolution_clock::now();
   auto *buf = read_buf.getLocal();
   const uint32_t owner_thread = ThreadPool::getTID();
 
@@ -1106,6 +1115,9 @@ int RdmaCommunication::post_read(
       abort();
     }
   }
+  auto _t1 = std::chrono::high_resolution_clock::now();
+  ctx->post_wr_us +=
+      std::chrono::duration_cast<std::chrono::microseconds>(_t1 - _t0).count();
 
   return 0;
 }
@@ -1218,6 +1230,7 @@ int RdmaCommunication::get_write_send_buf(
 int RdmaCommunication::post_write_send(
     int machine_id, uint32_t buf_id, uint32_t size, ControlType control) {
   auto *ctx = rdma_ctx.getLocal();
+  auto _t0 = std::chrono::high_resolution_clock::now();
 
   if (buf_id >= MAX_WRITE_NUM) {
     fprintf(stderr,
@@ -1243,6 +1256,9 @@ int RdmaCommunication::post_write_send(
         machine_id, buf_id);
     abort();
   }
+  auto _t1 = std::chrono::high_resolution_clock::now();
+  ctx->post_wr_us +=
+      std::chrono::duration_cast<std::chrono::microseconds>(_t1 - _t0).count();
   return 0;
 }
 
@@ -1250,6 +1266,7 @@ int RdmaCommunication::post_sg_write_send(
     int machine_id, uint32_t buf_id, std::vector<char *> &sg_ptr,
     std::vector<uint32_t> &sg_size, ControlType control) {
   auto *ctx = rdma_ctx.getLocal();
+  auto _t0 = std::chrono::high_resolution_clock::now();
   size_t offset = MAX_QUERYBUFFER_SIZE * buf_id;
   // TODO: <<16 use macro
   if (ctx->run_post_sg_write_send(
@@ -1260,6 +1277,9 @@ int RdmaCommunication::post_sg_write_send(
         machine_id);
     abort();
   }
+  auto _t1 = std::chrono::high_resolution_clock::now();
+  ctx->post_wr_us +=
+      std::chrono::duration_cast<std::chrono::microseconds>(_t1 - _t0).count();
   return 0;
 }
 
