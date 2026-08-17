@@ -499,6 +499,7 @@ static void test_vs_recall(
         // Stage timing accumulators (atomic, accessed from multiple threads)
         std::atomic<uint64_t> sum_pre_us(0), sum_post_us(0), sum_term_us(0);
         std::atomic<size_t> stage_cnt(0);
+        std::atomic<uint64_t> sum_dispatch_us(0), sum_yield_us(0), sum_comp_l_us(0), sum_comp_r_us(0);
 #ifdef LAT
         // for latency record
         std::chrono::high_resolution_clock::time_point start[qsize];
@@ -581,6 +582,11 @@ static void test_vs_recall(
             sum_post_us.fetch_add(res->post_stage_us, std::memory_order_relaxed);
             sum_term_us.fetch_add(res->term_us, std::memory_order_relaxed);
             stage_cnt.fetch_add(1, std::memory_order_relaxed);
+            // Accumulate POST_STAGE sub-timing
+            sum_dispatch_us.fetch_add(res->post_dispatch_us, std::memory_order_relaxed);
+            sum_yield_us.fetch_add(res->post_yield_us, std::memory_order_relaxed);
+            sum_comp_l_us.fetch_add(res->post_compute_l_us, std::memory_order_relaxed);
+            sum_comp_r_us.fetch_add(res->post_compute_r_us, std::memory_order_relaxed);
             delete res;
             load_cnt.fetch_add(1);
             // printf("load_cnt ++: %u\n", load_cnt.load());
@@ -662,6 +668,18 @@ static void test_vs_recall(
                   printf("-------------- Stage Timing (avg per query, cnt=%zu) --------------\n", stage_cnt.load());
                   printf("  PRE_STAGE  (routing+dispatch): %.2f us  (%.1f%%)\n", avg_pre, avg_pre * 100.0 / avg_total);
                   printf("  POST_STAGE (main search)     : %.2f us  (%.1f%%)\n", avg_post, avg_post * 100.0 / avg_total);
+                  // POST_STAGE sub-breakdown
+                  double avg_disp = (double)sum_dispatch_us.load() / stage_cnt.load();
+                  double avg_yield = (double)sum_yield_us.load() / stage_cnt.load();
+                  double avg_cl = (double)sum_comp_l_us.load() / stage_cnt.load();
+                  double avg_cr = (double)sum_comp_r_us.load() / stage_cnt.load();
+                  double post_sum = avg_disp + avg_yield + avg_cl + avg_cr;
+                  if (post_sum > 0) {
+                    printf("    DISPATCH    (post RDMA)    : %.2f us  (%.1f%% of POST)\n", avg_disp, avg_disp * 100.0 / post_sum);
+                    printf("    YIELD_WAIT  (wait remote)  : %.2f us  (%.1f%% of POST)\n", avg_yield, avg_yield * 100.0 / post_sum);
+                    printf("    COMPUTE_L   (local dist)   : %.2f us  (%.1f%% of POST)\n", avg_cl, avg_cl * 100.0 / post_sum);
+                    printf("    COMPUTE_R   (remote res)   : %.2f us  (%.1f%% of POST)\n", avg_cr, avg_cr * 100.0 / post_sum);
+                  }
                   printf("  TERMINATION(token passing)   : %.2f us  (%.1f%%)\n", avg_term, avg_term * 100.0 / avg_total);
                   printf("  TOTAL                        : %.2f us\n", avg_total);
                   printf("------------------------  End  ------------------------\n");

@@ -2379,6 +2379,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
 #endif
       global_query[query_id]->state = POST_STAGE;
       bool all_result_recved = false;
+      auto sub_tp = std::chrono::high_resolution_clock::now();
       auto &post_cnt = global_query[query_id]->post_cnt;
       auto &recv_cnt = global_query[query_id]->recv_cnt;
       auto &nocore_post = global_query[query_id]->nocore_post;
@@ -2499,7 +2500,23 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
             suspend to proc recved remote tasks .
             */
           // printf("post suspend with p %u r %u\n", post_cnt, recv_cnt);
+          // Record DISPATCH time, start YIELD timer
+          {
+            auto now = std::chrono::high_resolution_clock::now();
+            global_query[query_id]->post_dispatch_us +=
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    now - sub_tp).count();
+            sub_tp = now;
+          }
           co_yield false;
+          // Record YIELD_WAIT time, start COMPUTE timer
+          {
+            auto now = std::chrono::high_resolution_clock::now();
+            global_query[query_id]->post_yield_us +=
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    now - sub_tp).count();
+            sub_tp = now;
+          }
           // printf("q%u search RESUME\n", query_id);
 #ifdef PROFILER
           m_profiler.start("post_stage");
@@ -2564,6 +2581,14 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
             }
             // Use work stealing across threads.
             do_task(task.value());
+          }
+          // Record COMPUTE_LOCAL time, start COMPUTE_REMOTE timer
+          {
+            auto now = std::chrono::high_resolution_clock::now();
+            global_query[query_id]->post_compute_l_us +=
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    now - sub_tp).count();
+            sub_tp = now;
           }
 
           for (;;) {
@@ -2685,6 +2710,14 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
 #ifdef PROFILER
           m_profiler.end("post_stage");
 #endif
+          // Record COMPUTE_REMOTE time, restart DISPATCH timer for next iter
+          {
+            auto now = std::chrono::high_resolution_clock::now();
+            global_query[query_id]->post_compute_r_us +=
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    now - sub_tp).count();
+            sub_tp = now;
+          }
         }
 
         // local termination, prop token

@@ -143,6 +143,11 @@ class QueryMsg {
   uint64_t post_stage_us{0};  // POST_STAGE: main search loop
   uint64_t term_us{0};        // TERMINATION: token passing
   std::chrono::high_resolution_clock::time_point stage_tp;
+  // POST_STAGE sub-timing (microseconds)
+  uint64_t post_dispatch_us{0};     // DISPATCH: pop candidates, post RDMA tasks
+  uint64_t post_yield_us{0};        // YIELD_WAIT: suspended waiting for remote results
+  uint64_t post_compute_l_us{0};    // COMPUTE_LOCAL: local distance computation
+  uint64_t post_compute_r_us{0};    // COMPUTE_REMOTE: process remote results
 
   QueryMsg() {}
   ~QueryMsg() {}
