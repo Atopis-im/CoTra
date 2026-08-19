@@ -71,6 +71,7 @@ usage() {
     "  --index-threads N    DiskANN/OpenMP build threads. Default: 8" \
     "  --rdma-threads N     CoTra/RDMA worker threads. Default: 8" \
     "  --build-jobs N       Parallel compile jobs. Default: 24" \
+    "  --lat                Enable per-query latency measurement (avg_lat column)." \
     "  --gid-index N        Override automatic RoCE GID selection." \
     "  --help               Show this message." \
     "" \
@@ -174,6 +175,10 @@ while (($# > 0)); do
     --build-jobs)
       BUILD_JOBS=${2:?missing value for --build-jobs}
       shift 2
+      ;;
+    --lat)
+      ENABLE_LAT=1
+      shift 1
       ;;
     --gid-index)
       GID_INDEX=${2:?missing value for --gid-index}
@@ -610,7 +615,8 @@ configure_and_build() {
     -DCMAKE_C_COMPILER="$CC_BIN" \
     -DCMAKE_CXX_COMPILER="$CXX_BIN" \
     -DCOTRA_MACHINE_NUM=2 \
-    -DCOTRA_MAX_THREAD_NUM=128
+    -DCOTRA_MAX_THREAD_NUM=128 \
+    ${ENABLE_LAT:+-DCOTRA_LAT=ON}
 
   note "BUILD"
   "$CMAKE_BIN" --build "$BUILD_DIR" -j "$BUILD_JOBS"

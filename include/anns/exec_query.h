@@ -39,7 +39,7 @@ static void test_vs_recall(
   vector<size_t> efs = {30, 400};
 #else
   // repeat first for warmup.
-  vector<size_t> efs = {3, 4, 5, 6, 8, 10, 15, 20, 30, 40, 50, 70, 100, 150, 200, 250, 300, 350, 400, 500, 600, 700};
+  vector<size_t> efs = {3, 4, 5, 6, 8, 10, 15, 20, 30, 40, 50, 70, 100, 150, 200, 250, 300, 400, 500, 600, 700};
 #endif
 
 #if defined(PROF_Q_DISTRI) || defined(PROF_ALL_Q_DISTRI)

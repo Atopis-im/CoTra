@@ -8,9 +8,9 @@ project(CoTra LANGUAGES C CXX)
 # script) actually take effect, so --deps-dir installs on nodes without
 # sudo do not accidentally pick up a system Boost headers-only install.
 if(POLICY CMP0144)
-  cmake_policy(SET CMP0144 NEW)
+cmake_policy(SET CMP0144 NEW)
 endif()
-
+ 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
    CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10.3)
   message(FATAL_ERROR
@@ -36,6 +36,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
 endif()
 
 option(COTRA_NATIVE_ARCH "Optimize for the CPU used to build CoTra" ON)
+option(COTRA_LAT "Enable per-query latency measurement (avg_lat column)" OFF)
 set(COTRA_MACHINE_NUM 16 CACHE STRING
   "Number of CoTra machines; every node must use the same value")
 set(COTRA_MAX_THREAD_NUM 128 CACHE STRING
@@ -51,8 +52,11 @@ endif()
 add_compile_definitions(
   HAVE_CXX0X
   MACHINE_NUM=${COTRA_MACHINE_NUM}
-  MAX_THREAD_NUM=${COTRA_MAX_THREAD_NUM}
-  COMM_PROFILE)
+  MAX_THREAD_NUM=${COTRA_MAX_THREAD_NUM})
+
+if(COTRA_LAT)
+  add_compile_definitions(LAT)
+endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_compile_definitions(_FILE_OFFSET_BITS=64)
@@ -64,98 +68,15 @@ endif()
 
 add_compile_options(
   $<$<CONFIG:Release>:-O3>
-  $<$<CONFIG:Release>:-g>
   $<$<CONFIG:Debug>:-g>)
-
-# Export symbols so backtrace_symbols_fd can resolve addresses in the
-# main executable (otherwise only shared-lib frames get symbol names).
-add_link_options($<$<CONFIG:Release>:-rdynamic>
-                 $<$<CONFIG:Debug>:-rdynamic>)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules")
 
 find_package(Threads REQUIRED)
 find_package(OpenMP REQUIRED)
 find_package(Boost 1.58 REQUIRED COMPONENTS
-  serialization iostreams program_options system filesystem regex)
+  serialization iostreams program_options system filesystem)
 find_package(fmt REQUIRED)
-
-# ---------------------------------------------------------------------------
-# Workaround: FindBoost.cmake on CMake 3.29 sometimes fails to register the
-# IMPORTED target for a Boost component even when the .so file actually
-# exists (e.g. Boost::regex for Boost::iostreams INTERFACE_LINK_LIBRARIES).
-# This happens because FindBoost searches for many library name variants
-# (with/without -mt suffix, compiler tag, ABI tag, etc.) and when none
-# matches exactly, it silently leaves Boost_<COMP>_LIBRARY empty and skips
-# target creation -- but we run on nodes with a minimal shared_deps bundle
-# where only libboost_<comp>.so.1.66.0 exists and the .so symlink is what
-# the linker really needs.
-#
-# For every expected Boost::* target that FindBoost failed to create, we
-# manually declare an UNKNOWN IMPORTED library using:
-#   - Boost_INCLUDE_DIRS (already set by FindBoost, since headers were OK)
-#   - find_library search on CMAKE_LIBRARY_PATH / CMAKE_PREFIX_PATH
-# The list of components below matches our COMPONENTS request plus the
-# Boost::iostreams implicit dep "regex" whose missing target produces the
-# exact error:
-#   The link interface of target "Boost::iostreams" contains: Boost::regex
-#   but the target was not found.
-# ---------------------------------------------------------------------------
-set(_boost_expected_components
-    regex serialization iostreams program_options system filesystem)
-
-foreach(_comp IN LISTS _boost_expected_components)
-  set(_tgt "Boost::${_comp}")
-  if(NOT TARGET "${_tgt}")
-    string(TOUPPER "${_comp}" _COMP)
-    # Prefer names FindBoost already set, otherwise search generic forms.
-    set(_candidates)
-    if(Boost_${_COMP}_LIBRARY)
-      list(APPEND _candidates "${Boost_${_COMP}_LIBRARY}")
-    endif()
-    if(Boost_${_COMP}_LIBRARY_RELEASE)
-      list(APPEND _candidates "${Boost_${_COMP}_LIBRARY_RELEASE}")
-    endif()
-    # Fallback: generic names we know our shared_deps install produces.
-    list(APPEND _candidates
-         "boost_${_comp}"
-         "boost_${_comp}-mt"
-         "boost_${_comp}-gcc"
-         "boost_${_comp}-mt-gcc")
-
-    unset(_found_lib CACHE)
-    find_library(_found_lib
-      NAMES ${_candidates}
-      DOC "Location of libboost_${_comp} library (fallback)"
-      NO_DEFAULT_PATH)
-    if(NOT _found_lib)
-      find_library(_found_lib
-        NAMES ${_candidates}
-        DOC "Location of libboost_${_comp} library (fallback, default)")
-    endif()
-
-    if(_found_lib)
-      message(STATUS "Fallback: creating imported target ${_tgt} from ${_found_lib}")
-      add_library("${_tgt}" UNKNOWN IMPORTED)
-      set_target_properties("${_tgt}" PROPERTIES
-        IMPORTED_LOCATION "${_found_lib}"
-        INTERFACE_INCLUDE_DIRECTORIES "${Boost_INCLUDE_DIRS}")
-      # Make Boost_<COMP>_FOUND look true for any downstream check.
-      set("Boost_${_COMP}_FOUND" TRUE CACHE BOOL "Fallback: boost_${_comp} found" FORCE)
-      set("Boost_${_COMP}_LIBRARY" "${_found_lib}" CACHE FILEPATH
-          "Fallback: boost_${_comp} library path" FORCE)
-    else()
-      message(FATAL_ERROR
-        "Boost component '${_comp}' library file not found. "
-        "Expected in deps dir under lib64/libboost_${_comp}.so / "
-        "libboost_${_comp}.so.1.66.0 . Please copy Boost .so files "
-        "(including regex, serialization, iostreams, program_options, "
-        "system, filesystem) from the system into your --deps-dir/lib64 "
-        "and make .so -> .so.1.66.0 symlinks, then retry cmake.")
-    endif()
-  endif()
-endforeach()
-unset(_boost_expected_components)
 
 find_path(MEMCACHED_INCLUDE_DIR NAMES libmemcached/memcached.h)
 find_library(MEMCACHED_LIBRARY NAMES memcached)

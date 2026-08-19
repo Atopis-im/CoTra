@@ -37,11 +37,6 @@ class RdmaContext {
 
   uint64_t read_size, read_cnt;  // bytes, number
   uint64_t write_size, write_cnt;
-  // Comm diagnostics (microseconds, accumulated across threads)
-  uint64_t post_wr_us{0};          // time spent in RDMA verbs post_*
-  uint64_t poll_cq_us{0};          // time spent in poll CQ
-  uint64_t remote_task_us{0};      // time spent processing pushed tasks (do_task)
-  uint64_t remote_task_cnt{0};     // number of pushed tasks executed locally
 
   MessageContext local_mr_msg[MACHINE_NUM];
   MessageContext remote_mr_msg[MACHINE_NUM];
@@ -111,8 +106,6 @@ class RdmaContext {
   void clear_size_cnt() {
     read_size = read_cnt = 0;
     write_size = write_cnt = 0;
-    post_wr_us = poll_cq_us = 0;
-    remote_task_us = remote_task_cnt = 0;
   }
 
   enum ibv_mtu set_mtu(uint8_t ib_port, int user_mtu);
