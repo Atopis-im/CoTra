@@ -67,7 +67,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules")
 find_package(Threads REQUIRED)
 find_package(OpenMP REQUIRED)
 find_package(Boost 1.58 REQUIRED COMPONENTS
-  serialization iostreams program_options system filesystem)
+  serialization iostreams program_options system filesystem regex)
 find_package(fmt REQUIRED)
 
 find_path(MEMCACHED_INCLUDE_DIR NAMES libmemcached/memcached.h)

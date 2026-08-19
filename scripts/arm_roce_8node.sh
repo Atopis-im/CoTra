@@ -716,8 +716,16 @@ configure_and_build() {
       "-DCMAKE_INCLUDE_PATH=${DEPS_DIR}/include;${DEPS_DIR}/include/openblas;${DEPS_DIR}/include/openblas-pthread;${DEPS_DIR}/include/aarch64-linux-gnu"
       "-DCMAKE_LIBRARY_PATH=${DEPS_DIR}/lib64"
     )
-    # CMAKE_PREFIX_PATH 帮助 find_package(Boost/fmt/OpenBLAS 等) 定位
+    # 帮助 find_package(Boost/fmt/OpenBLAS 等) 定位 deps 目录
     cmake_extra+=("-DCMAKE_PREFIX_PATH=${DEPS_DIR}")
+    # FindBoost.cmake 兜底 hints：如果系统装了另一版本 boost 但没装 devel，
+    # 就强制指向 deps 目录，避免它找到 /usr/include/boost 但找不到 .so
+    if [[ -d ${DEPS_DIR}/include/boost ]]; then
+      cmake_extra+=("-DBOOST_ROOT=${DEPS_DIR}")
+      cmake_extra+=("-DBOOST_INCLUDEDIR=${DEPS_DIR}/include")
+      cmake_extra+=("-DBOOST_LIBRARYDIR=${DEPS_DIR}/lib64")
+      cmake_extra+=("-DBoost_NO_SYSTEM_PATHS=ON")
+    fi
     # 让 linker 知道 rpath，同时环境变量 LDFLAGS 兜底
     local deps_rpath="-Wl,-rpath,${DEPS_DIR}/lib64"
     cmake_extra+=(
