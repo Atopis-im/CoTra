@@ -769,14 +769,75 @@ runtime_preflight() {
   locked=$(ulimit -l)
   [[ $locked == unlimited ]] ||
     die "max locked memory must be unlimited for this first RDMA run; found ${locked}"
-  if [[ -n $DEPS_DIR ]]; then
-    # 确保运行期能找到 shared_deps/lib64 里的 .so
-    if [[ -n ${LD_LIBRARY_PATH:-} ]]; then
-      export LD_LIBRARY_PATH="${DEPS_DIR}/lib64:${LD_LIBRARY_PATH}"
-    else
-      export LD_LIBRARY_PATH="${DEPS_DIR}/lib64"
-    fi
+
+  # ------------------------------------------------------------------
+  # Runtime shared-library search order (most reliable first match wins):
+  #   1. DEPS_DIR/lib64 (boost/fmt/openblas/numa/rdmacm/... self-bundled)
+  #   2. Well-known system runtime dirs on Kylin V10 aarch64
+  #      (gcc libgfortran / libquadmath / libibverbs are often placed
+  #       directly in /usr/lib64, sometimes only under gcc dirs or the
+  #       multiarch tuples; listing them explicitly avoids silent
+  #       mismatches between ld.so.conf + ldconfig cache across nodes.)
+  #   3. Whatever the user already exported in LD_LIBRARY_PATH.
+  # ------------------------------------------------------------------
+  local _sys_paths=(
+    /usr/lib64
+    /lib64
+    /usr/lib/aarch64-linux-gnu
+    /lib/aarch64-linux-gnu
+    /usr/lib/gcc/aarch64-linux-gnu/10
+    /usr/lib/gcc/aarch64-linux-gnu/10.3.0
+    /usr/local/lib64
+  )
+  local _ld=""
+  if [[ -n $DEPS_DIR && -d ${DEPS_DIR}/lib64 ]]; then
+    _ld="${DEPS_DIR}/lib64"
   fi
+  for p in "${_sys_paths[@]}"; do
+    [[ -d $p ]] || continue
+    if [[ -n $_ld ]]; then
+      _ld="${_ld}:${p}"
+    else
+      _ld="${p}"
+    fi
+  done
+  if [[ -n ${LD_LIBRARY_PATH:-} ]]; then
+    _ld="${_ld}:${LD_LIBRARY_PATH}"
+  fi
+  if [[ -n $_ld ]]; then
+    export LD_LIBRARY_PATH="$_ld"
+  fi
+
+  # ------------------------------------------------------------------
+  # Verify scala_index/scala_anns can resolve ALL their NEEDED entries
+  # right now before starting a long-running job (segfault / exit 127
+  # only once the RDMA barrier starts is very costly for 8-node runs).
+  # "ldd -r" also triggers IFUNC resolution so we catch ifunc-based
+  # libc symbol issues too.
+  # ------------------------------------------------------------------
+  local _bin _missing
+  for _bin in \
+    "${BUILD_DIR}/tests/scala_index" \
+    "${BUILD_DIR}/tests/scala_anns"
+  do
+    _missing=$(LD_LIBRARY_PATH="$LD_LIBRARY_PATH" ldd -r "$_bin" 2>&1 \
+               | awk '/not found/{print $1}' | sort -u | tr '\n' ' ')
+    if [[ -n ${_missing// } ]]; then
+      die "Runtime libraries missing for ${_bin} (${HOSTNAME} node ${LOCAL_NODE_ID}): ${_missing}.
+  Fix: either install the corresponding rpm package on this node,
+  or (preferred) copy those .so files from the leader (agent-21) into
+  --deps-dir/lib64 then rsync --deps-dir to all nodes.
+  Typical missing deps on fresh runtime nodes:
+    libgfortran.so.4   (from gcc-gfortran runtime, needed by OpenBLAS)
+    libquadmath.so.0   (from libquadmath runtime, GCC 10 companion)
+    libibverbs.so.1    (from rdma-core libibverbs)
+    librdmacm.so.1     (from rdma-core librdmacm)
+    libmemcached.so.11 (from libmemcached)
+    libboost_*.so.1.66.0 (regex/serialization/iostreams/...).
+  Then re-run the deployment step."
+    fi
+  done
+
   local omp_threads=$RDMA_THREADS
   if [[ $MODE == index ]]; then
     omp_threads=$INDEX_THREADS
