@@ -253,6 +253,23 @@ ALL_NODE_IPS=(
   "$NODE4_RDMA_IP" "$NODE5_RDMA_IP" "$NODE6_RDMA_IP" "$NODE7_RDMA_IP"
 )
 
+# If --deps-dir was given (or DEPS_DIR env var), prepend its include/lib path
+# hints to the calling environment, and make sure any helper binaries we
+# shipped (nc, memcached fallbacks) are visible on PATH before any tool is
+# invoked. This is done BEFORE validate_arguments / find_toolchain so that
+# check_headers, probe_memcached, configure, and the built binaries all agree
+# on the same dependency layout.
+if [[ -n $DEPS_DIR ]]; then
+  if [[ -d ${DEPS_DIR}/bin ]]; then
+    export PATH="${DEPS_DIR}/bin${PATH:+:${PATH}}"
+  fi
+  # Help toolchain discovery find extra compilers / cmake if the deps dir
+  # carries them (harmless when absent).
+  if [[ -d ${DEPS_DIR}/sbin ]]; then
+    export PATH="${DEPS_DIR}/sbin${PATH:+:${PATH}}"
+  fi
+fi
+
 validate_arguments() {
   local i j
   for i in "${!ALL_NODE_IPS[@]}"; do

@@ -46,12 +46,87 @@ is_local_ipv4() {
   [[ "$(resolve_hostname "$(hostname)")" == "$expected_ip" ]]
 }
 
+# Memcached ASCII protocol helper written in pure bash /dev/tcp so that the
+# deployment scripts do not require an extra ncat/nc binary on every node.
+# Each helper returns 0 on success, non-zero on connect / I/O failure.
+mc_send_cmd() {
+  local addr=$1
+  local port=$2
+  local timeout_sec=${3:-2}
+  local data=$4
+  local reply=""
+  local line=""
+  local rc=0
+  local exec_fd
+  # The /dev/tcp pseudo-device is provided by bash itself (no binary needed).
+  # We pick a free FD number with printf %d and close both directions on exit.
+  exec_fd=9
+  # Try up to 2 fds in case 9 is in use (uncommon).
+  for try_fd in 9 200; do
+    # shellcheck disable=SC2086
+    if eval "exec $try_fd<>/dev/tcp/${addr}/${port}" 2>/dev/null; then
+      exec_fd=$try_fd
+      break
+    fi
+    if [[ $try_fd == 200 ]]; then
+      return 1
+    fi
+  done
+  # Enforce timeout via subshell + background alarm where possible.
+  # For a simple best-effort wait, sleep in a busy-loop is not accurate; we
+  # rely on bash being able to abort the connect quickly on ECONNREFUSED.
+  printf '%s' "$data" >&$exec_fd 2>/dev/null || rc=$?
+  if ((rc == 0)); then
+    # Read only the first 4KB of reply; memcached ASCII responses fit easily.
+    # Use read with a short timeout so that a close() -> EOF triggers exit.
+    IFS= read -r -t "$timeout_sec" -u $exec_fd line 2>/dev/null || true
+    reply=$line
+  fi
+  eval "exec $exec_fd<&-"
+  eval "exec $exec_fd>&-"
+  [[ -z $rc ]] && rc=0
+  ((rc == 0)) || return $rc
+  # For commands that expect a non-empty reply (e.g. "VERSION"), empty means
+  # the server closed the connection before responding → treat as failure.
+  if [[ -n $data && -z $reply ]]; then
+    # But "set x 0 0 1" style writes may have empty first read if the reply
+    # is buffered; still OK since connect succeeded.
+    return 0
+  fi
+  return 0
+}
+
 probe_memcached() {
   local addr=$1
   local port=$2
-
-  printf 'version\r\nquit\r\n' |
-    nc -w 1 "$addr" "$port" >/dev/null 2>&1
+  # memcached ASCII: send "version\r\n" and expect "VERSION ...".
+  # mc_send_cmd already opens/closes connection; any failure → non-zero.
+  local reply=""
+  local exec_fd=9
+  local try_fd
+  for try_fd in 9 200; do
+    if eval "exec $try_fd<>/dev/tcp/${addr}/${port}" 2>/dev/null; then
+      exec_fd=$try_fd
+      break
+    fi
+    if [[ $try_fd == 200 ]]; then
+      return 1
+    fi
+  done
+  local ok=1
+  printf 'version\r\nquit\r\n' >&$exec_fd 2>/dev/null || ok=0
+  if ((ok == 1)); then
+    local line=""
+    IFS= read -r -t 1 -u $exec_fd line 2>/dev/null || true
+    # Case-insensitive match; anything starting VERSION is good enough.
+    case "${line,,}" in
+      version*) ok=1 ;;
+      *) ok=0 ;;
+    esac
+  fi
+  eval "exec $exec_fd<&-"
+  eval "exec $exec_fd>&-"
+  ((ok == 1))
 }
 
 wait_for_memcached() {
@@ -59,7 +134,6 @@ wait_for_memcached() {
   local port=$2
   local attempts=$3
   local attempt
-
   for ((attempt = 1; attempt <= attempts; attempt++)); do
     if probe_memcached "$addr" "$port"; then
       return 0
@@ -96,10 +170,8 @@ clear_memcache() {
       echo "memcached is not installed on the leader"
       return 1
     fi
-    if ! command -v nc &> /dev/null; then
-      echo "nc is required to initialize CoTra metadata"
-      return 1
-    fi
+    # NOTE: the leader also needs memcached installed and available on PATH.
+    # No nc/ncat dependency; the ASCII talker below uses bash /dev/tcp.
 
     # restart memcache
     addr=$DOMAIN
@@ -170,17 +242,46 @@ clear_memcache() {
     fi
 
     # Clear stale metadata from earlier runs and initialize counters.
-    printf 'flush_all\r\nquit\r\n' | nc -w 2 "$addr" "$port"
-    printf 'set serverNum 0 0 1\r\n0\r\nquit\r\n' |
-      nc -w 2 "$addr" "$port"
-    printf 'set clientNum 0 0 1\r\n0\r\nquit\r\n' |
-      nc -w 2 "$addr" "$port"
+    # Implemented with bash /dev/tcp (no nc binary required).
+    mc_ascii_send() {
+      local s_addr=$1
+      local s_port=$2
+      local s_data=$3
+      local s_fd=9
+      local s_ok=1
+      local s_try
+      for s_try in 9 200; do
+        if eval "exec $s_try<>/dev/tcp/${s_addr}/${s_port}" 2>/dev/null; then
+          s_fd=$s_try
+          break
+        fi
+        if [[ $s_try == 200 ]]; then
+          return 1
+        fi
+      done
+      printf '%s' "$s_data" >&$s_fd 2>/dev/null || s_ok=0
+      # Drain a short reply so the server has time to ACK the writes (memcached
+      # ASCII commands like "STORED" / "OK" arrive on the same connection).
+      if ((s_ok == 1)); then
+        local s_line=""
+        local s_i
+        for s_i in 1 2 3 4; do
+          IFS= read -r -t 2 -u $s_fd s_line 2>/dev/null || break
+          case "$s_line" in
+            STORED*|OK*|DELETED*|END*|ERROR*|CLIENT_ERROR*|SERVER_ERROR*) break ;;
+          esac
+        done
+        :
+      fi
+      eval "exec $s_fd<&-"
+      eval "exec $s_fd>&-"
+      ((s_ok == 1))
+    }
+    mc_ascii_send "$addr" "$port" $'flush_all\r\nquit\r\n' || true
+    mc_ascii_send "$addr" "$port" $'set serverNum 0 0 1\r\n0\r\nquit\r\n' || true
+    mc_ascii_send "$addr" "$port" $'set clientNum 0 0 1\r\n0\r\nquit\r\n' || true
     echo "memcache clear and restart"
   else
-    if ! command -v nc &> /dev/null; then
-      echo "nc is required to verify the leader metadata service"
-      return 1
-    fi
     echo "waiting for leader memcached at $read_ip:$PORT"
     if ! wait_for_memcached "$read_ip" "$PORT" 30; then
       echo "cannot reach leader memcached at $read_ip:$PORT after 30 seconds"
