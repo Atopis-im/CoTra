@@ -1,6 +1,16 @@
 cmake_minimum_required(VERSION 3.16)
 project(CoTra LANGUAGES C CXX)
 
+# CMake 3.29 introduced CMP0144: find_package() now uses the
+# <PACKAGENAME>_ROOT variables (matching the package-name case, e.g.
+# Boost_ROOT) instead of the historical ALL_CAPS BOOST_ROOT. Setting NEW
+# here makes our Boost_ROOT hint (passed from the 8-node deployment
+# script) actually take effect, so --deps-dir installs on nodes without
+# sudo do not accidentally pick up a system Boost headers-only install.
+if(POLICY CMP0144)
+  cmake_policy(SET CMP0144 NEW)
+endif()
+
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
    CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10.3)
   message(FATAL_ERROR

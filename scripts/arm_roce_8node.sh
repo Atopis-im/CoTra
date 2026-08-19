@@ -720,11 +720,17 @@ configure_and_build() {
     cmake_extra+=("-DCMAKE_PREFIX_PATH=${DEPS_DIR}")
     # FindBoost.cmake 兜底 hints：如果系统装了另一版本 boost 但没装 devel，
     # 就强制指向 deps 目录，避免它找到 /usr/include/boost 但找不到 .so
+    # CMake 3.29+ 需要 <PkgName>_ROOT（驼峰）且 CMP0144 NEW 才能用，
+    # 但 <PKG>_ROOT（全大写）老版本 FindBoost.cmake 也认，同时传一份。
     if [[ -d ${DEPS_DIR}/include/boost ]]; then
+      cmake_extra+=("-DBoost_ROOT=${DEPS_DIR}")
       cmake_extra+=("-DBOOST_ROOT=${DEPS_DIR}")
       cmake_extra+=("-DBOOST_INCLUDEDIR=${DEPS_DIR}/include")
       cmake_extra+=("-DBOOST_LIBRARYDIR=${DEPS_DIR}/lib64")
       cmake_extra+=("-DBoost_NO_SYSTEM_PATHS=ON")
+      # FindBoost.cmake (before 3.30) 仍然认老拼写，也保持传递
+      cmake_extra+=("-DBoost_INCLUDE_DIR=${DEPS_DIR}/include")
+      cmake_extra+=("-DBoost_LIBRARY_DIR_RELEASE=${DEPS_DIR}/lib64")
     fi
     # 让 linker 知道 rpath，同时环境变量 LDFLAGS 兜底
     local deps_rpath="-Wl,-rpath,${DEPS_DIR}/lib64"
