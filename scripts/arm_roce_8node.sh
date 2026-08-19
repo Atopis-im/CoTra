@@ -42,6 +42,7 @@ BUILD_DRAM_GB="${BUILD_DRAM_GB:-64}"
 MAX_DEGREE="${MAX_DEGREE:-48}"
 BUILD_L="${BUILD_L:-500}"
 RESULT_K="${RESULT_K:-10}"
+DEPS_DIR="${DEPS_DIR:-}"
 LOCAL_NODE_ID=""
 CMAKE_BIN=""
 CC_BIN=""
@@ -84,6 +85,8 @@ usage() {
     "  --rdma-threads N     CoTra/RDMA worker threads. Default: 8" \
     "  --build-jobs N       Parallel compile jobs. Default: 24" \
     "  --gid-index N        Override automatic RoCE GID selection." \
+    "  --deps-dir PATH      Shared dir with include/lib64 copied from a healthy" \
+    "                       node (e.g. shared_deps: include/ + lib64/ subdirs)." \
     "  --help               Show this message." \
     "" \
     "Start node 0 first on every mode, then nodes 1..7."
@@ -222,6 +225,10 @@ while (($# > 0)); do
       IB_PORT=${2:?missing value for --ib-port}
       shift 2
       ;;
+    --deps-dir)
+      DEPS_DIR=${2:?missing value for --deps-dir}
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -285,6 +292,11 @@ validate_arguments() {
   fi
   [[ $DATA_TYPE == float ]] || die "this GIST script currently expects float vectors"
   [[ $DISTANCE == l2 ]] || die "this GIST script currently expects L2 distance"
+  if [[ -n $DEPS_DIR ]]; then
+    [[ -d $DEPS_DIR ]] || die "--deps-dir does not exist: ${DEPS_DIR}"
+    [[ -d ${DEPS_DIR}/include ]] || die "--deps-dir is missing ${DEPS_DIR}/include subdirectory"
+    mkdir -p "${DEPS_DIR}/lib64" 2>/dev/null || true
+  fi
 }
 
 has_local_ipv4() {
@@ -418,6 +430,17 @@ check_headers() {
   )
   local include_arguments=()
   local include_dir
+  if [[ -n $DEPS_DIR ]]; then
+    for include_dir in \
+      "${DEPS_DIR}/include" \
+      "${DEPS_DIR}/include/openblas" \
+      "${DEPS_DIR}/include/openblas-pthread" \
+      "${DEPS_DIR}/include/aarch64-linux-gnu"; do
+      if [[ -d $include_dir ]]; then
+        include_arguments+=(-I "$include_dir")
+      fi
+    done
+  fi
   for include_dir in \
     /usr/include/openblas \
     /usr/include/openblas-pthread \
@@ -442,7 +465,7 @@ check_headers() {
     fi
   done
   ((missing == 0)) ||
-    die "development headers are missing; load modules or ask the administrator for the corresponding -devel packages"
+    die "development headers are missing; use --deps-dir or ask the administrator for the corresponding -devel packages"
 }
 
 read_text_file() {
@@ -670,12 +693,33 @@ configure_and_build() {
       die "existing build directory was configured for ${cached_machine_count} nodes; choose a new --build-dir"
     fi
   fi
+  local cmake_extra=()
+  if [[ -n $DEPS_DIR ]]; then
+    cmake_extra+=(
+      "-DCMAKE_INCLUDE_PATH=${DEPS_DIR}/include;${DEPS_DIR}/include/openblas;${DEPS_DIR}/include/openblas-pthread;${DEPS_DIR}/include/aarch64-linux-gnu"
+      "-DCMAKE_LIBRARY_PATH=${DEPS_DIR}/lib64"
+    )
+    # CMAKE_PREFIX_PATH 帮助 find_package(Boost/fmt/OpenBLAS 等) 定位
+    cmake_extra+=("-DCMAKE_PREFIX_PATH=${DEPS_DIR}")
+    # 让 linker 知道 rpath，同时环境变量 LDFLAGS 兜底
+    local deps_rpath="-Wl,-rpath,${DEPS_DIR}/lib64"
+    cmake_extra+=(
+      "-DCMAKE_BUILD_RPATH=${DEPS_DIR}/lib64"
+      "-DCMAKE_INSTALL_RPATH=${DEPS_DIR}/lib64"
+      "-DCMAKE_SKIP_BUILD_RPATH=OFF"
+      "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON"
+      "-DCMAKE_EXE_LINKER_FLAGS=${deps_rpath} ${CMAKE_EXE_LINKER_FLAGS:-}"
+      "-DCMAKE_SHARED_LINKER_FLAGS=${deps_rpath} ${CMAKE_SHARED_LINKER_FLAGS:-}"
+    )
+    export LDFLAGS="${deps_rpath} ${LDFLAGS:-}"
+  fi
   "$CMAKE_BIN" -S "$REPO_ROOT" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER="$CC_BIN" \
     -DCMAKE_CXX_COMPILER="$CXX_BIN" \
     -DCOTRA_MACHINE_NUM=$NUM_NODES \
-    -DCOTRA_MAX_THREAD_NUM=128
+    -DCOTRA_MAX_THREAD_NUM=128 \
+    "${cmake_extra[@]}"
 
   note "BUILD"
   "$CMAKE_BIN" --build "$BUILD_DIR" -j "$BUILD_JOBS"
@@ -694,6 +738,14 @@ runtime_preflight() {
   locked=$(ulimit -l)
   [[ $locked == unlimited ]] ||
     die "max locked memory must be unlimited for this first RDMA run; found ${locked}"
+  if [[ -n $DEPS_DIR ]]; then
+    # 确保运行期能找到 shared_deps/lib64 里的 .so
+    if [[ -n ${LD_LIBRARY_PATH:-} ]]; then
+      export LD_LIBRARY_PATH="${DEPS_DIR}/lib64:${LD_LIBRARY_PATH}"
+    else
+      export LD_LIBRARY_PATH="${DEPS_DIR}/lib64"
+    fi
+  fi
   local omp_threads=$RDMA_THREADS
   if [[ $MODE == index ]]; then
     omp_threads=$INDEX_THREADS
