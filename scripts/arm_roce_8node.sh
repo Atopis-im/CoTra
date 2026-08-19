@@ -771,14 +771,23 @@ runtime_preflight() {
     die "max locked memory must be unlimited for this first RDMA run; found ${locked}"
 
   # ------------------------------------------------------------------
-  # Runtime shared-library search order (most reliable first match wins):
-  #   1. DEPS_DIR/lib64 (boost/fmt/openblas/numa/rdmacm/... self-bundled)
-  #   2. Well-known system runtime dirs on Kylin V10 aarch64
-  #      (gcc libgfortran / libquadmath / libibverbs are often placed
-  #       directly in /usr/lib64, sometimes only under gcc dirs or the
-  #       multiarch tuples; listing them explicitly avoids silent
-  #       mismatches between ld.so.conf + ldconfig cache across nodes.)
-  #   3. Whatever the user already exported in LD_LIBRARY_PATH.
+  # Runtime shared-library search order (FIRST MATCH WINS):
+  #   Tier A. DEPS_DIR/lib64
+  #        -> boost/fmt/openblas/numa/rdmacm + the GCC-10 runtime we
+  #           explicitly ship (libstdc++.so.6 / libgfortran.so.4 /
+  #           libquadmath.so.0 / libgcc_s.so.1).
+  #        -> MUST be listed BEFORE /usr/lib64 and /usr/lib/gcc/**
+  #           because the stock Kylin V10 image ships GCC 7.3 runtime
+  #           (libstdc++.so.6.0.24, GLIBCXX max 3.4.24) while we build
+  #           with GCC 10.3 which needs at least GLIBCXX_3.4.26. If we
+  #           put /usr/lib64 first, ld.so silently loads the GCC-7
+  #           libstdc++.so and the binary dies at startup with:
+  #             "version `GLIBCXX_3.4.26' not found".
+  #   Tier B. Kylin V10 standard runtime dirs (kept as fallback if the
+  #           user decides NOT to ship GCC runtime in deps_dir).
+  #   Tier C. User-provided LD_LIBRARY_PATH (keeps their override, but
+  #           we insert ours BEFORE so the well-known tier A always wins
+  #           when a file exists).
   # ------------------------------------------------------------------
   local _sys_paths=(
     /usr/lib64
@@ -801,8 +810,11 @@ runtime_preflight() {
       _ld="${p}"
     fi
   done
+  # USER LD_LIBRARY_PATH at the front so they can override, but we
+  # deduplicate by re-adding ours so tier A effectively wins when a
+  # given SONAME exists both in deps and user paths.
   if [[ -n ${LD_LIBRARY_PATH:-} ]]; then
-    _ld="${_ld}:${LD_LIBRARY_PATH}"
+    _ld="${LD_LIBRARY_PATH}:${_ld}"
   fi
   if [[ -n $_ld ]]; then
     export LD_LIBRARY_PATH="$_ld"
@@ -810,31 +822,84 @@ runtime_preflight() {
 
   # ------------------------------------------------------------------
   # Verify scala_index/scala_anns can resolve ALL their NEEDED entries
-  # right now before starting a long-running job (segfault / exit 127
-  # only once the RDMA barrier starts is very costly for 8-node runs).
-  # "ldd -r" also triggers IFUNC resolution so we catch ifunc-based
-  # libc symbol issues too.
+  # AND all required GLIBCXX_* symbol versions exist in the libstdc++
+  # that ld.so is actually going to load.
+  # Output formats parsed here (from glibc ldd):
+  #   "libfoo.so.2 => not found"           -> real NEEDED .so missing
+  #   "libbar.so.3 => /some/path/libbar.so.3 (0x...)" -> OK (no action)
+  #   "/path/bin: libstdc++.so.6: version `GLIBCXX_X.Y.Z' not found
+  #       (required by /path/bin)"                           -> version conflict
+  # We do NOT treat "version X not found" lines as a missing .so name,
+  # because awk '/not found/' without further filtering would mistake
+  # them for a missing library and print the whole sentence.
   # ------------------------------------------------------------------
-  local _bin _missing
+  local _bin _missing _badvers _check_msg
   for _bin in \
     "${BUILD_DIR}/tests/scala_index" \
     "${BUILD_DIR}/tests/scala_anns"
   do
-    _missing=$(LD_LIBRARY_PATH="$LD_LIBRARY_PATH" ldd -r "$_bin" 2>&1 \
-               | awk '/not found/{print $1}' | sort -u | tr '\n' ' ')
-    if [[ -n ${_missing// } ]]; then
-      die "Runtime libraries missing for ${_bin} (${HOSTNAME} node ${LOCAL_NODE_ID}): ${_missing}.
-  Fix: either install the corresponding rpm package on this node,
-  or (preferred) copy those .so files from the leader (agent-21) into
-  --deps-dir/lib64 then rsync --deps-dir to all nodes.
+    _check_msg=$(LD_LIBRARY_PATH="$LD_LIBRARY_PATH" ldd -r "$_bin" 2>&1)
+
+    # 1) Actual NEEDED libraries that have no file on the search path.
+    _missing=$(printf '%s\n' "$_check_msg" \
+      | awk '/not found/ && $2 == "=>" {print $1}' \
+      | sort -u | tr '\n' ' ')
+
+    # 2) Symbol-version mismatch (typically libstdc++ runtime too old).
+    _badvers=$(printf '%s\n' "$_check_msg" \
+      | awk -v sq="'" '
+          /version/ && /not found/ {
+            # Pull the "GLIBCXX_x.y.z" token out of the sentence.
+            for (i = 1; i <= NF; i++) {
+              if ($i ~ "GLIBCXX_.*" || $i ~ "GLIBC_.*" || $i ~ "GOMP_.*" || $i ~ "LIBGOMP_.*") {
+                gsub("[:", sq, "", $i);
+                print $i;
+              }
+            }
+            # Also keep a short description: which SONAME is conflicted.
+            for (i = 1; i <= NF; i++) if ($i ~ /\.so\.[0-9]+/) { gsub(":$","",$i); print $i; break }
+          }' | sort -u | tr '\n' ' ')
+
+    if [[ -n ${_missing// } || -n ${_badvers// } ]]; then
+      local extra_hint=""
+      if [[ -n ${_badvers// } ]]; then
+        extra_hint="
+  GLIBCXX/GCC symbol VERSION CONFLICT detected (tokens: ${_badvers}).
+  This almost always means:
+    - The binary was compiled with GCC 10.3 (GLIBCXX >= 3.4.26).
+    - BUT ld.so is loading a GCC 7-era libstdc++.so.6.0.24 from
+      the system (/usr/lib64) OR from shared_deps/lib64 you copied
+      from a GCC-7 machine.
+  Fix (on agent-21, where GCC-10 is located):
+    1) source ~/m00613325/tools/env.sh
+    2) Locate GCC-10 runtime using:
+         g++ -print-file-name=libstdc++.so.6
+         g++ -print-file-name=libgfortran.so.4
+         g++ -print-file-name=libquadmath.so.0
+         g++ -print-file-name=libgcc_s.so.1
+    3) Copy each one into --deps-dir/lib64 (do NOT copy from /usr/lib64
+       on Kylin V10 — that is GCC 7).
+    4) Remove any GCC-7 files accidentally added to deps/lib64,
+       especially libstdc++.so.6.0.24 and its symlink.
+    5) Because deps-dir is shared on NFS, all 8 nodes pick it up after
+       the rsync/copy completes."
+      fi
+      die "Runtime check failed for ${_bin} (${HOSTNAME} node ${LOCAL_NODE_ID}):
+  Missing NEEDED .so files: [${_missing}]
+  Symbol-version mismatch:   [${_badvers}]${extra_hint}
+
+  Generic Fix: either install the corresponding rpm package on this
+  node, or (SAFER) copy matching SONAME + SYMBOL-VERSION .so files
+  from the GCC-10 toolchain (agent-21 ~/m00613325/tools/...) into
+  --deps-dir/lib64.
   Typical missing deps on fresh runtime nodes:
     libgfortran.so.4   (from gcc-gfortran runtime, needed by OpenBLAS)
-    libquadmath.so.0   (from libquadmath runtime, GCC 10 companion)
+    libquadmath.so.0   (GCC 10 companion lib)
     libibverbs.so.1    (from rdma-core libibverbs)
     librdmacm.so.1     (from rdma-core librdmacm)
     libmemcached.so.11 (from libmemcached)
     libboost_*.so.1.66.0 (regex/serialization/iostreams/...).
-  Then re-run the deployment step."
+  Then re-run this step."
     fi
   done
 
