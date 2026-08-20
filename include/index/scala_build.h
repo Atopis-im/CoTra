@@ -5,6 +5,7 @@
 #include "index/disk_utils.h"
 #include "index/math_utils.h"
 #include "rdma/rdma_comm.h"
+#include <chrono>
 
 /**
  * ScalaBuild: Build ScalaGraph based on vector data and index algorithm.
@@ -948,20 +949,30 @@ class ScalaBuild {
               << " index frozen: " << index_frozen << std::endl;
     std::cout << ele_num << " nodes read.\n";
 
-    std::cout << "start write index\n";
+    std::cout << "start write index, total size: " << merge_graph_size
+              << " bytes (" << num_blocks << " blocks)\n" << std::flush;
     // write index
     cached_ofstream output(
         index_param.final_b1_index_path, BUFFER_SIZE_FOR_CACHED_IO);
     // write merge graph in block
     size_t write_blk_size = 64 * 1024 * 1024;
     num_blocks = DIV_ROUND_UP(merge_graph_size, write_blk_size);
+    auto write_start = std::chrono::steady_clock::now();
     for (uint64_t i = 0; i < num_blocks; i++) {
       size_t cur_block_size =
           write_blk_size > merge_graph_size - (i * write_blk_size)
               ? merge_graph_size - (i * write_blk_size)
               : write_blk_size;
       output.write(merge_graph + i * write_blk_size, cur_block_size);
-      sleep(2);
+      if (i % 32 == 0 || i == num_blocks - 1) {
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - write_start).count();
+        double pct = (double)(i + 1) * 100.0 / num_blocks;
+        double speed = (i + 1) * write_blk_size / (1024.0 * 1024.0) / (elapsed > 0 ? elapsed : 1);
+        std::cout << "  b1 write progress: " << (int)pct << "% ("
+                  << (i + 1) << "/" << num_blocks << " blocks, "
+                  << elapsed << "s, " << speed << " MB/s)\n" << std::flush;
+      }
     }
     std::cout << " b1 graph vnum num:" << ele_num << "\n";
     std::cout << "Transfer index to b1graph over: "
@@ -1216,19 +1227,29 @@ int trans_to_b2graph() {
   diskann::cout << "\nExpected size: " << b2_graph_size << std::endl;
   diskann::cout << "Finished merge" << std::endl;
 
-  std::cout << "start write index\n";
+  std::cout << "start write index, total size: " << b2_graph_size
+            << " bytes (" << num_blocks << " blocks)\n" << std::flush;
   // write index
   std::ofstream b2_writer(index_param.local_b2_index_file.c_str(), std::ios::binary);
   // write merge graph in block
   size_t write_blk_size = 64 * 1024 * 1024;
   size_t num_blocks = DIV_ROUND_UP(b2_graph_size, write_blk_size);
+  auto b2_write_start = std::chrono::steady_clock::now();
   for (uint64_t i = 0; i < num_blocks; i++) {
     size_t cur_block_size =
         write_blk_size > b2_graph_size - (i * write_blk_size)
             ? b2_graph_size - (i * write_blk_size)
             : write_blk_size;
     b2_writer.write(b2_graph + i * write_blk_size, cur_block_size);
-    sleep(2);
+    if (i % 32 == 0 || i == num_blocks - 1) {
+      auto now = std::chrono::steady_clock::now();
+      double elapsed = std::chrono::duration<double>(now - b2_write_start).count();
+      double pct = (double)(i + 1) * 100.0 / num_blocks;
+      double speed = (i + 1) * write_blk_size / (1024.0 * 1024.0) / (elapsed > 0 ? elapsed : 1);
+      std::cout << "  b2 write progress: " << (int)pct << "% ("
+                << (i + 1) << "/" << num_blocks << " blocks, "
+                << elapsed << "s, " << speed << " MB/s)\n" << std::flush;
+    }
   }
   std::cout << "b2 graph vnum num:" << vec_num << "\n";
   std::cout << "Transfer index to b2graph over: "
