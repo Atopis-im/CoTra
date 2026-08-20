@@ -1227,13 +1227,13 @@ int trans_to_b2graph() {
   diskann::cout << "\nExpected size: " << b2_graph_size << std::endl;
   diskann::cout << "Finished merge" << std::endl;
 
-  std::cout << "start write index, total size: " << b2_graph_size
-            << " bytes (" << num_blocks << " blocks)\n" << std::flush;
   // write index
   std::ofstream b2_writer(index_param.local_b2_index_file.c_str(), std::ios::binary);
   // write merge graph in block
   size_t write_blk_size = 64 * 1024 * 1024;
   size_t num_blocks = DIV_ROUND_UP(b2_graph_size, write_blk_size);
+  std::cout << "start write index, total size: " << b2_graph_size
+            << " bytes (" << num_blocks << " blocks)\n" << std::flush;
   auto b2_write_start = std::chrono::steady_clock::now();
   for (uint64_t i = 0; i < num_blocks; i++) {
     size_t cur_block_size =
