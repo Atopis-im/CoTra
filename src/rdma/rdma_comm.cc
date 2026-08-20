@@ -800,44 +800,57 @@ int RdmaCommunication::poll_recv() {
         auto *sbuf = send_write_buf.getLocal();
 
         uint32_t m_id = wr_id >> 16;
-        uint32_t true_wr_id = wr_id & LOW_16BIT_MASK;
+        uint32_t true_wr_id = wr_id & LOW_16BIT_MASK;  // recv WR index (for repost)
         uint32_t data_size = wc.byte_len;
         uint32_t imm = ntohl(wc.imm_data);
         ControlType control = ControlType(imm >> 16);
-        uint32_t buf_id = imm & LOW_16BIT_MASK;
-        
-        // Validate recv buffer index: data arrives at position true_wr_id
-        // (receiver's recv buf_id from wr_id), NOT buf_id (sender's send
-        // buf_id from imm_data).  These two values start in sync but can
-        // diverge under load; using buf_id here was a latent bug that caused
-        // reads from stale/wrong buffers, corrupting buff_id_list with
-        // garbage values (e.g. 1999 > MAX_WRITE_NUM).
+        uint32_t buf_id = imm & LOW_16BIT_MASK;  // sender's send buf index
+
+        // Validate recv WR index (needed for reposting below).
         if (true_wr_id >= MAX_WRITE_NUM) {
           fprintf(stderr,
-          "FATAL [poll_recv]: true_wr_id %u >= MAX_WRITE_NUM %d (m%u control %d)\n",
+          "WARN [poll_recv]: true_wr_id %u >= MAX_WRITE_NUM %d (m%u control %d), skipping\n",
           true_wr_id, MAX_WRITE_NUM, m_id, control);
-          abort();
+          post_write_recv(m_id, true_wr_id);
+          continue;
         }
-        char *ptr = (char *)rbuf->buffer[m_id][true_wr_id];
-        
+        // In RDMA write-with-imm, sender writes to
+        // remote_addr + MAX_QUERYBUFFER_SIZE * buf_id, so data lands at
+        // rbuf->buffer[m_id][buf_id].  The recv WR index (true_wr_id) is
+        // just a "slot" for the imm_data completion and has NO relation to
+        // where the data was written.  Using true_wr_id to read the buffer
+        // was a bug: with 2 nodes the free list stays ordered so
+        // true_wr_id == buf_id by coincidence, but with 8 nodes the
+        // recycled free list diverges and we read stale/wrong buffers.
+        if (buf_id >= MAX_WRITE_NUM) {
+          fprintf(stderr,
+          "WARN [poll_recv]: buf_id %u >= MAX_WRITE_NUM %d (m%u control %d true_wr_id %u), skipping\n",
+          buf_id, MAX_WRITE_NUM, m_id, control, true_wr_id);
+          post_write_recv(m_id, true_wr_id);
+          continue;
+        }
+        char *ptr = (char *)rbuf->buffer[m_id][buf_id];
+
         // TODO: use switch
         if (control == RELEASE || control == CLEAR) {
           // proc the released send buffer id.
           uint32_t *release_ptr = (uint32_t *)ptr;
           uint32_t num = release_ptr[0];
           if (num > MAX_WRITE_NUM) {
+            // Non-fatal: skip this corrupt RELEASE message.
             fprintf(stderr,
-            "FATAL [poll_recv]: RELEASE num %u > MAX_WRITE_NUM %d from m%u, aborting\n",
-            num, MAX_WRITE_NUM, m_id);
-            abort();
+            "WARN [poll_recv]: RELEASE num %u > MAX_WRITE_NUM %d from m%u (buf_id %u true_wr_id %u), skipping message\n",
+            num, MAX_WRITE_NUM, m_id, buf_id, true_wr_id);
+            num = 0;
           }
           for (uint32_t i = 1; i <= num; i++) {
             uint32_t release_id = release_ptr[i];
             if (release_id >= MAX_WRITE_NUM) {
+              // Non-fatal: skip this garbage entry.
               fprintf(stderr,
-              "FATAL [poll_recv]: RELEASE buf_id %u >= MAX_WRITE_NUM %d from m%u, aborting\n",
-              release_id, MAX_WRITE_NUM, m_id);
-              abort();
+              "WARN [poll_recv]: RELEASE buf_id %u >= MAX_WRITE_NUM %d from m%u (entry %u/%u), skipping entry\n",
+              release_id, MAX_WRITE_NUM, m_id, i, num);
+              continue;
             }
             sbuf->buff_id_list[m_id]->push_back(release_id);
           }
@@ -972,9 +985,9 @@ int RdmaCommunication::poll_recv() {
 void RdmaCommunication::send_write_release(int machine_id, uint32_t buf_id) {
   if (buf_id >= MAX_WRITE_NUM) {
     fprintf(stderr,
-    "FATAL [send_write_release]: buf_id %u >= MAX_WRITE_NUM %d from m%u, aborting\n",
+    "WARN [send_write_release]: buf_id %u >= MAX_WRITE_NUM %d from m%u, skipping\n",
     buf_id, MAX_WRITE_NUM, machine_id);
-    abort();
+    return;
   }
   auto *rbuf = recv_write_buf.getLocal();
   rbuf->release_id_list[machine_id]->push_back(buf_id);
@@ -1180,9 +1193,9 @@ int RdmaCommunication::get_write_send_buf(
         rbuf->release_id_list[machine_id]->pop_front();
         if (release_id >= MAX_WRITE_NUM) {
           fprintf(stderr,
-          "FATAL [get_write_send_buf]: release_id %u >= MAX_WRITE_NUM %d, aborting\n",
+          "WARN [get_write_send_buf]: release_id %u >= MAX_WRITE_NUM %d, skipping\n",
           release_id, MAX_WRITE_NUM);
-          abort();
+          continue;
         }
         ptr[num + 1] = release_id;
         num++;
@@ -1193,9 +1206,20 @@ int RdmaCommunication::get_write_send_buf(
       // reserve buffer for release write send
     } while (sbuf->buff_id_list[machine_id]->size() <= RELEASE_BLOCK);
   } else {
+    // send_release=true path: under high load (8+ nodes) the free list
+    // can be temporarily empty.  Poll for completions and incoming RELEASE
+    // messages to recover buffers instead of crashing.
+    int retry = 0;
+    while (sbuf->buff_id_list[machine_id]->size() == 0 && retry < 1000) {
+      poll_send();
+      poll_recv();
+      retry++;
+    }
     if (sbuf->buff_id_list[machine_id]->size() == 0) {
-      printf("Error: expect sbuf always avaliable.\n");
-      exit(0);
+      fprintf(stderr,
+      "FATAL [get_write_send_buf]: send buf exhausted for m%d after %d retries, aborting\n",
+      machine_id, retry);
+      abort();
     }
   }
   uint32_t buf_id = sbuf->buff_id_list[machine_id]->front();

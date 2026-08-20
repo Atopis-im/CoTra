@@ -21,13 +21,26 @@ export OPENBLAS_NUM_THREADS=96
 export MAX_DEGREE=64   # M
 export BUILD_L=40     # efC
 
+# # 只看 recall/QPS
+# export COTRA_STAGE_TIMING=0
+# export COTRA_AVG_LAT=0
+
+# # 只看 有 POST合计 但没有4个子项
+export COTRA_STAGE_TIMING=1
+
+# # 只看 有 POST合计 有4个子项
+# export COTRA_STAGE_TIMING=2
+
+
 # SHARED_BUILD_DIR="/home/team/alg_mathlib/c30061081/CoTra/build"
 # RUN_OUTPUT="/home/team/alg_mathlib/c30061081/CoTra/index_cyy"
 SHARED_BUILD_DIR="/home/team/alg_mathlib/c30061081/CoTra/build-arm-8node-agent-23"
-RUN_OUTPUT="/home/team/alg_mathlib/c30061081/dataset/gist_1M_960/cotra_8node_index"
+# RUN_OUTPUT="/home/team/alg_mathlib/c30061081/dataset/gist_1M_960/cotra_8node_index"
+RUN_OUTPUT="/home/team/alg_mathlib/c30061081/dataset/laion100m/cotra_8node_index"
 
 bash scripts/arm_roce_8node.sh search \
   --deps-dir /home/team/alg_mathlib/c30061081/shared_deps \
+  --dataset-dir /home/team/alg_mathlib/c30061081/dataset/laion100m \
   --node0-rdma-ip 33.40.10.121 \
   --node1-rdma-ip 33.40.10.122 \
   --node2-rdma-ip 33.40.10.123 \
@@ -38,3 +51,4 @@ bash scripts/arm_roce_8node.sh search \
   --node7-rdma-ip 33.40.10.128 \
   --build-dir "$SHARED_BUILD_DIR" \
   --output-dir "$RUN_OUTPUT"
+  

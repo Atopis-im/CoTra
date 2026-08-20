@@ -26,10 +26,13 @@ export BUILD_L=40     # efC
 # SHARED_BUILD_DIR="/home/team/alg_mathlib/c30061081/CoTra/build"
 # RUN_OUTPUT="/home/team/alg_mathlib/c30061081/CoTra/index_cyy"
 SHARED_BUILD_DIR="/home/team/alg_mathlib/c30061081/CoTra/build-arm-8node-agent-23"
-RUN_OUTPUT="/home/team/alg_mathlib/c30061081/dataset/gist_1M_960/cotra_8node_index"
+# RUN_OUTPUT="/home/team/alg_mathlib/c30061081/dataset/gist_1M_960/cotra_8node_index"
+RUN_OUTPUT="/home/team/alg_mathlib/c30061081/dataset/laion100m/cotra_8node_index"
+
 
 bash scripts/arm_roce_8node.sh index \
   --deps-dir /home/team/alg_mathlib/c30061081/shared_deps \
+  --dataset-dir /home/team/alg_mathlib/c30061081/dataset/laion100m \
   --node0-rdma-ip 33.40.10.121 \
   --node1-rdma-ip 33.40.10.122 \
   --node2-rdma-ip 33.40.10.123 \

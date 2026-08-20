@@ -616,7 +616,7 @@ validate_vector_file() {
 }
 
 check_dataset() {
-  note "GIST DATASET"
+  note "DATASET CHECK"
   [[ -d $DATASET_DIR ]] || die "dataset directory does not exist: ${DATASET_DIR}"
   command -v od >/dev/null 2>&1 || die "od is required to inspect bin headers"
   command -v stat >/dev/null 2>&1 || die "stat is required to inspect bin files"
@@ -635,9 +635,9 @@ check_dataset() {
   validate_vector_file query "$QUERY_FILE" "$QUERY_ROWS" "$QUERY_DIM" 4
   validate_vector_file gt "$GT_FILE" "$GT_ROWS" "$GT_K" 4
 
-  ((BASE_ROWS == 1000000)) || die "expected GIST 1M base rows, found ${BASE_ROWS}"
-  ((BASE_DIM == 960)) || die "expected GIST dimension 960, found ${BASE_DIM}"
-  ((QUERY_DIM == BASE_DIM)) || die "query dimension does not match base dimension"
+  ((BASE_ROWS > 0)) || die "base row count is 0"
+  ((BASE_DIM > 0)) || die "base dimension is 0"
+  ((QUERY_DIM == BASE_DIM)) || die "query dimension ${QUERY_DIM} does not match base dimension ${BASE_DIM}"
   ((GT_ROWS >= QUERY_ROWS)) || die "GT contains fewer queries than query.bin"
   ((GT_K >= RESULT_K)) || die "GT K=${GT_K} is smaller than requested K=${RESULT_K}"
 
@@ -646,8 +646,8 @@ check_dataset() {
   minimum_gt_size=$((8 + GT_ROWS * GT_K * 4))
   ((gt_size >= minimum_gt_size)) ||
     die "GT file is too short for ${GT_ROWS}x${GT_K} uint32 neighbor IDs"
-  ((BASE_ROWS % 1000000 == 0)) || die "base row count is not an integer number of millions"
-  MILLION=$((BASE_ROWS / 1000000))
+
+  MILLION=$(( (BASE_ROWS + 999999) / 1000000 ))
 
   printf 'Base:  %s (%s x %s float32)\n' "$BASE_FILE" "$BASE_ROWS" "$BASE_DIM"
   printf 'Query: %s (%s x %s float32)\n' "$QUERY_FILE" "$QUERY_ROWS" "$QUERY_DIM"
