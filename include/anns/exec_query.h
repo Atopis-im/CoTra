@@ -3,11 +3,11 @@
 #include <omp.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <queue>
 #include <unordered_set>
-#include <chrono>
 
 #include "anns/scala_search.h"
 #include "coromem/include/galois/bag.h"
@@ -659,8 +659,16 @@ static void test_vs_recall(
 #ifdef COMM_PROFILE
                 appr_alg.report_comm_info(exec_time);
 #endif
-                // Print stage timing breakdown
-                if (stage_cnt.load() > 0) {
+                // Stage timing breakdown control:
+                //   COTRA_STAGE_TIMING=0 | unset -> 不打印
+                //   COTRA_STAGE_TIMING=1        -> 打印简洁版 (POST_PRE_TERM 合计，无POST子项)
+                //   COTRA_STAGE_TIMING=2        -> 打印完整版 (含DISPATCH/YIELD/COMPUTE_L/COMPUTE_R)
+                static int stage_timing_mode = -1;
+                if (stage_timing_mode < 0) {
+                  const char *env = std::getenv("COTRA_STAGE_TIMING");
+                  stage_timing_mode = (env && *env) ? std::atoi(env) : 2; // 默认=2(完整)，保持之前行为
+                }
+                if (stage_cnt.load() > 0 && stage_timing_mode >= 1) {
                   double avg_pre = (double)sum_pre_us.load() / stage_cnt.load();
                   double avg_post = (double)sum_post_us.load() / stage_cnt.load();
                   double avg_term = (double)sum_term_us.load() / stage_cnt.load();
@@ -668,17 +676,18 @@ static void test_vs_recall(
                   printf("-------------- Stage Timing (avg per query, cnt=%zu) --------------\n", stage_cnt.load());
                   printf("  PRE_STAGE  (routing+dispatch): %.2f us  (%.1f%%)\n", avg_pre, avg_pre * 100.0 / avg_total);
                   printf("  POST_STAGE (main search)     : %.2f us  (%.1f%%)\n", avg_post, avg_post * 100.0 / avg_total);
-                  // POST_STAGE sub-breakdown
-                  double avg_disp = (double)sum_dispatch_us.load() / stage_cnt.load();
-                  double avg_yield = (double)sum_yield_us.load() / stage_cnt.load();
-                  double avg_cl = (double)sum_comp_l_us.load() / stage_cnt.load();
-                  double avg_cr = (double)sum_comp_r_us.load() / stage_cnt.load();
-                  double post_sum = avg_disp + avg_yield + avg_cl + avg_cr;
-                  if (post_sum > 0) {
-                    printf("    DISPATCH    (post RDMA)    : %.2f us  (%.1f%% of POST)\n", avg_disp, avg_disp * 100.0 / post_sum);
-                    printf("    YIELD_WAIT  (wait remote)  : %.2f us  (%.1f%% of POST)\n", avg_yield, avg_yield * 100.0 / post_sum);
-                    printf("    COMPUTE_L   (local dist)   : %.2f us  (%.1f%% of POST)\n", avg_cl, avg_cl * 100.0 / post_sum);
-                    printf("    COMPUTE_R   (remote res)   : %.2f us  (%.1f%% of POST)\n", avg_cr, avg_cr * 100.0 / post_sum);
+                  if (stage_timing_mode >= 2) {
+                    double avg_disp = (double)sum_dispatch_us.load() / stage_cnt.load();
+                    double avg_yield = (double)sum_yield_us.load() / stage_cnt.load();
+                    double avg_cl = (double)sum_comp_l_us.load() / stage_cnt.load();
+                    double avg_cr = (double)sum_comp_r_us.load() / stage_cnt.load();
+                    double post_sum = avg_disp + avg_yield + avg_cl + avg_cr;
+                    if (post_sum > 0) {
+                      printf("    DISPATCH    (post RDMA)    : %.2f us  (%.1f%% of POST)\n", avg_disp, avg_disp * 100.0 / post_sum);
+                      printf("    YIELD_WAIT  (wait remote)  : %.2f us  (%.1f%% of POST)\n", avg_yield, avg_yield * 100.0 / post_sum);
+                      printf("    COMPUTE_L   (local dist)   : %.2f us  (%.1f%% of POST)\n", avg_cl, avg_cl * 100.0 / post_sum);
+                      printf("    COMPUTE_R   (remote res)   : %.2f us  (%.1f%% of POST)\n", avg_cr, avg_cr * 100.0 / post_sum);
+                    }
                   }
                   printf("  TERMINATION(token passing)   : %.2f us  (%.1f%%)\n", avg_term, avg_term * 100.0 / avg_total);
                   printf("  TOTAL                        : %.2f us\n", avg_total);
@@ -701,7 +710,16 @@ static void test_vs_recall(
       for(uint32_t q = load_start; q < load_start + query_load; q++){
         all_lat += duration_cast<std::chrono::microseconds>(end[q] - start[q]).count();
       }
-      std::cout << "Avg lat: " << all_lat / query_load << "us\n";
+      {
+        static int lat_mode = -1;
+        if (lat_mode < 0) {
+          const char *env = std::getenv("COTRA_AVG_LAT");
+          lat_mode = (env && *env) ? std::atoi(env) : 1; // 默认打印
+        }
+        if (lat_mode) {
+          std::cout << "Avg lat: " << all_lat / query_load << "us\n";
+        }
+      }
 #endif
 
 
