@@ -57,6 +57,7 @@ QUERY_DIM=0
 GT_ROWS=0
 GT_K=0
 MILLION=0
+RESULT_QSIZE=""
 
 NUM_NODES=8
 ALL_NODE_IPS=()
@@ -85,6 +86,12 @@ usage() {
     "  --index-threads N    DiskANN/OpenMP build threads. Default: 8" \
     "  --rdma-threads N     CoTra/RDMA worker threads. Default: 8" \
     "  --max-threads N      Compile-time thread array size cap. Default: 128" \
+    "  --max-degree R       Graph max out-degree (M/R). 8node default: 48" \
+    "  --build-l L          Build queue size / efC. 8node default: 500" \
+    "  --search-dram-gb GB  Search-stage DRAM cap / -B.  Default: 16" \
+    "  --build-dram-gb GB   Build-stage DRAM cap / -M.   Default: 64" \
+    "  --query-size N       Search query count. Default: auto from file header" \
+    "  --res-knn K          Recall@K target. Default: 10" \
     "  --build-jobs N       Parallel compile jobs. Default: 24" \
     "  --gid-index N        Override automatic RoCE GID selection." \
     "  --deps-dir PATH      Shared dir with include/lib64 copied from a healthy" \
@@ -932,7 +939,7 @@ run_search() {
     --data_path "$BASE_FILE"
     --query_path "$QUERY_FILE"
     --gt_path "$GT_FILE"
-    --query_size "$QUERY_ROWS"
+    --query_size "${RESULT_QSIZE:-$QUERY_ROWS}"
     --res_knn "$RESULT_K"
     --index_path_prefix "${OUTPUT_DIR}/merged_index"
     -R "$MAX_DEGREE"
