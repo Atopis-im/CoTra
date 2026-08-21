@@ -27,6 +27,7 @@ NODE4_RDMA_IP="${NODE4_RDMA_IP:-}"
 NODE5_RDMA_IP="${NODE5_RDMA_IP:-}"
 NODE6_RDMA_IP="${NODE6_RDMA_IP:-}"
 NODE7_RDMA_IP="${NODE7_RDMA_IP:-}"
+MAX_THREAD_NUM="${MAX_THREAD_NUM:-128}"
 LEADER_IP="${LEADER_IP:-71.54.52.21}"
 MEMCACHED_PORT="${MEMCACHED_PORT:-18516}"
 RDMA_DEVICE="${RDMA_DEVICE:-mlx5_0}"
@@ -83,6 +84,7 @@ usage() {
     "  --threads N          Set both index and RDMA threads (legacy)." \
     "  --index-threads N    DiskANN/OpenMP build threads. Default: 8" \
     "  --rdma-threads N     CoTra/RDMA worker threads. Default: 8" \
+    "  --max-threads N      Compile-time thread array size cap. Default: 128" \
     "  --build-jobs N       Parallel compile jobs. Default: 24" \
     "  --gid-index N        Override automatic RoCE GID selection." \
     "  --deps-dir PATH      Shared dir with include/lib64 copied from a healthy" \
@@ -292,6 +294,7 @@ validate_arguments() {
   for pair in \
     "index threads:${INDEX_THREADS}" \
     "RDMA threads:${RDMA_THREADS}" \
+    "max thread cap:${MAX_THREAD_NUM}" \
     "build jobs:${BUILD_JOBS}" \
     "memcached port:${MEMCACHED_PORT}" \
     "IB port:${IB_PORT}" \
@@ -301,9 +304,9 @@ validate_arguments() {
     is_positive_integer "$value" || die "${name} must be a positive integer"
   done
   ((MEMCACHED_PORT <= 65535)) || die "memcached port is too large"
-  ((INDEX_THREADS <= 128)) || die "index threads must not exceed 128"
-  ((RDMA_THREADS <= 128)) ||
-    die "RDMA threads must not exceed COTRA_MAX_THREAD_NUM=128"
+  ((INDEX_THREADS <= MAX_THREAD_NUM)) || die "index threads must not exceed MAX_THREAD_NUM=${MAX_THREAD_NUM}"
+  ((RDMA_THREADS <= MAX_THREAD_NUM)) ||
+    die "RDMA threads must not exceed MAX_THREAD_NUM=${MAX_THREAD_NUM}"
   if [[ -n $GID_INDEX ]]; then
     is_nonnegative_integer "$GID_INDEX" || die "GID index must be non-negative"
   fi
@@ -749,7 +752,7 @@ configure_and_build() {
     -DCMAKE_C_COMPILER="$CC_BIN" \
     -DCMAKE_CXX_COMPILER="$CXX_BIN" \
     -DCOTRA_MACHINE_NUM=$NUM_NODES \
-    -DCOTRA_MAX_THREAD_NUM=128 \
+    -DCOTRA_MAX_THREAD_NUM=$MAX_THREAD_NUM \
     "${cmake_extra[@]}"
 
   note "BUILD"
