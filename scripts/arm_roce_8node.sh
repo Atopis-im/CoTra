@@ -37,6 +37,7 @@ THREADS="${THREADS:-8}"
 INDEX_THREADS="${INDEX_THREADS:-$THREADS}"
 RDMA_THREADS="${RDMA_THREADS:-$THREADS}"
 BUILD_JOBS="${BUILD_JOBS:-24}"
+ENABLE_LAT="${ENABLE_LAT:-0}"
 BARRIER_TIMEOUT="${BARRIER_TIMEOUT:-1800}"
 SEARCH_DRAM_GB="${SEARCH_DRAM_GB:-16}"
 BUILD_DRAM_GB="${BUILD_DRAM_GB:-64}"
@@ -236,6 +237,38 @@ while (($# > 0)); do
       ;;
     --deps-dir)
       DEPS_DIR=${2:?missing value for --deps-dir}
+      shift 2
+      ;;
+    --lat)
+      ENABLE_LAT=1
+      shift 1
+      ;;
+    --max-threads)
+      MAX_THREAD_NUM=${2:?missing value for --max-threads}
+      shift 2
+      ;;
+    --max-degree)
+      MAX_DEGREE=${2:?missing value for --max-degree}
+      shift 2
+      ;;
+    --build-l)
+      BUILD_L=${2:?missing value for --build-l}
+      shift 2
+      ;;
+    --search-dram-gb)
+      SEARCH_DRAM_GB=${2:?missing value for --search-dram-gb}
+      shift 2
+      ;;
+    --build-dram-gb)
+      BUILD_DRAM_GB=${2:?missing value for --build-dram-gb}
+      shift 2
+      ;;
+    --query-size)
+      RESULT_QSIZE=${2:?missing value for --query-size}
+      shift 2
+      ;;
+    --res-knn)
+      RESULT_K=${2:?missing value for --res-knn}
       shift 2
       ;;
     --help|-h)
@@ -754,12 +787,17 @@ configure_and_build() {
     )
     export LDFLAGS="${deps_rpath} ${LDFLAGS:-}"
   fi
+  local lat_cmake=()
+  if (( ENABLE_LAT )); then
+    lat_cmake=(-DCOTRA_LAT=ON)
+  fi
   "$CMAKE_BIN" -S "$REPO_ROOT" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER="$CC_BIN" \
     -DCMAKE_CXX_COMPILER="$CXX_BIN" \
     -DCOTRA_MACHINE_NUM=$NUM_NODES \
     -DCOTRA_MAX_THREAD_NUM=$MAX_THREAD_NUM \
+    "${lat_cmake[@]}" \
     "${cmake_extra[@]}"
 
   note "BUILD"
