@@ -33,6 +33,10 @@ BUILD_DRAM_GB="${BUILD_DRAM_GB:-64}"
 MAX_DEGREE="${MAX_DEGREE:-48}"
 BUILD_L="${BUILD_L:-500}"
 RESULT_K="${RESULT_K:-10}"
+# 方法选择：cotra|shard|kshard|single|global (见 arm_roce_8node.sh 注释)
+APP_MODE="${APP_MODE:-cotra}"
+APP_TYPE="${APP_TYPE:-scala_v3}"
+GRAPH_TYPE="${GRAPH_TYPE:-scalagraph_v3}"
 LOCAL_NODE_ID=""
 CMAKE_BIN=""
 CC_BIN=""
@@ -232,6 +236,26 @@ while (($# > 0)); do
       ;;
     --res-knn)
       RESULT_K=${2:?missing value for --res-knn}
+      shift 2
+      ;;
+    --app-mode)
+      APP_MODE=${2:?missing value for --app-mode}
+      case "$APP_MODE" in
+        cotra)   APP_TYPE="scala_v3";        GRAPH_TYPE="scalagraph_v3" ;;
+        shard)   APP_TYPE="b2";              GRAPH_TYPE="shared_nothing" ;;
+        kshard)  APP_TYPE="b2kmeansbatch";   GRAPH_TYPE="shared_nothing" ;;
+        single)  APP_TYPE="single";          GRAPH_TYPE="vamana" ;;
+        global)  APP_TYPE="single";          GRAPH_TYPE="vamana" ;;
+        *) die "unknown --app-mode: $APP_MODE (cotra|shard|kshard|single|global)" ;;
+      esac
+      shift 2
+      ;;
+    --app-type)
+      APP_TYPE=${2:?missing value for --app-type}
+      shift 2
+      ;;
+    --graph-type)
+      GRAPH_TYPE=${2:?missing value for --graph-type}
       shift 2
       ;;
     --help|-h)
@@ -721,7 +745,7 @@ run_index() {
   local command=(
     "${BUILD_DIR}/tests/scala_index"
     --config_file "$CONFIG_FILE"
-    --graph_type scalagraph_v3
+    --graph_type "$GRAPH_TYPE"
     --data_type "$DATA_TYPE"
     --dist_fn "$DISTANCE"
     --data_path "$BASE_FILE"
@@ -761,8 +785,8 @@ run_search() {
   local command=(
     "${BUILD_DIR}/tests/scala_anns"
     --config_file "$CONFIG_FILE"
-    --app_type scala_v3
-    --graph_type scalagraph_v3
+    --app_type "$APP_TYPE"
+    --graph_type "$GRAPH_TYPE"
     --data_type "$DATA_TYPE"
     --dist_fn "$DISTANCE"
     --data_path "$BASE_FILE"
