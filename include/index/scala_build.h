@@ -50,6 +50,11 @@ class ScalaBuild {
     } else if (index_param.graph_type == GraphType::KmeansSharedNothing) {
       index_param.replica_num = 1; // set to one
       kmeans_partition();
+    } else if (index_param.graph_type == GraphType::VAMANA) {
+      // Single-machine baseline: no partition needed, build all data locally.
+      index_param.replica_num = 1;
+      index_param.num_parts = 1;
+      std::cout << "VAMANA baseline: skip partition, build all data locally.\n";
     } else {
       std::cerr << "Error: Graph type not supported.\n";
       abort();

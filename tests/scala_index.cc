@@ -35,7 +35,14 @@ int main(int argc, char **argv) {
   // Start to do partition and dispatch.
   scala_build.partition();
 
-  
+  if (index_param.graph_type == GraphType::VAMANA) {
+    // Single-machine baseline: build all data locally, no RDMA merge needed.
+    if (rdma_param.machine_id == 0) {
+      scala_build.single_build();
+    }
+    return 0;
+  }
+
   // Build local partition index.
   scala_build.swap_partition_info();
 
