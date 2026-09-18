@@ -2,7 +2,9 @@
 
 #include <sys/mman.h>
 
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -72,12 +74,51 @@ void *allocPages(unsigned num, bool preFault) {
     if (!ptr) {
       static std::once_flag warning;
       std::call_once(warning, []() {
+        // Print the kernel's actual hugepage size so the mismatch with our
+        // hardcoded 2 MiB is obvious in the log (e.g. aarch64 64 KiB base
+        // page kernels often default to 512 MiB hugepages, which the 2 MiB
+        // MAP_HUGETLB path can never use).
+        size_t kbs = 0;
+        std::ifstream mi("/proc/meminfo");
+        std::string ml;
+        while (std::getline(mi, ml) &&
+               sscanf(ml.c_str(), "Hugepagesize: %zu kB", &kbs) != 1) {
+        }
         printf(
-            "WARN: Compatible 2 MiB huge pages are unavailable. Falling "
-            "back to normal pages.\n");
+            "WARN: 2 MiB explicit hugepages unavailable (kernel hugepage "
+            "size = %zu kB, program needs 2048 kB).\n"
+            "      Falling back to normal pages; requesting Transparent "
+            "Hugepages via madvise(MADV_HUGEPAGE) (no root needed).\n",
+            kbs);
       });
       ptr = trymmap(num * hugePageSize, preFault ? _MAP_POP : _MAP);
     }
+
+#ifdef MADV_HUGEPAGE
+    // No-root hugepage path.  Explicit 2 MiB hugepages are dead on kernels
+    // whose default hugepage size != 2 MiB (e.g. 512 MiB on 64 KiB-base
+    // aarch64), and we cannot reserve pages without root.  Transparent
+    // Hugepages are the workaround: madvise(MADV_HUGEPAGE) marks the VMA so
+    // the kernel backs it with THP on fault.  Effective when THP is 'always'
+    // or 'madvise'; a harmless no-op (returns EINVAL) when 'never'.
+    //
+    // Timing: this runs inside allocPages, BEFORE the caller (numa_mem.cpp
+    // pageIn) first-touches the pages, so the faults use THP.  For the
+    // preFault=true path MAP_POPULATE already faulted base pages, so THP
+    // then relies on khugepaged collapsing them asynchronously -- less
+    // reliable, but the big interleaved data buffers use preFault=false.
+    if (ptr) {
+      if (madvise(ptr, (size_t)num * hugePageSize, MADV_HUGEPAGE) != 0) {
+        static std::once_flag thp_warn;
+        std::call_once(thp_warn, []() {
+          printf("INFO: madvise(MADV_HUGEPAGE) failed (errno=%d %s); THP "
+                 "may be disabled. Check: "
+                 "/sys/kernel/mm/transparent_hugepage/enabled\n",
+                 errno, strerror(errno));
+        });
+      }
+    }
+#endif
 
     if (!ptr) {
       printf("Out of Memory.\n");

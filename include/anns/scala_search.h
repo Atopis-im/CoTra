@@ -177,8 +177,10 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
       abort();
     }
     
+    // Value-initialise (= zero-init pointers) so scala_search_init can
+    // safely distinguish "old query from previous ef" from "garbage".
     global_query =
-        (QueryMsg<dist_t> **)new QueryMsg<dist_t> *[anns_param.qsize];
+        (QueryMsg<dist_t> **)new QueryMsg<dist_t> *[anns_param.qsize]();
     if (anns_param.app_type == SINGLE_MACHINE) {
       printf("Single machine baseline ...\n");
       graph_index.b1_graph->loadIndex();
@@ -406,7 +408,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
           printf("\n");
           abort();
         }
-        rdma_comm.release_cache(r.buffer_id);
+        rdma_comm.release_cache(r.buffer_id, r.owner_thread);
         // printf(" %d", r.buffer_id);
       }
       // printf("\n");
@@ -1102,6 +1104,12 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
               offsetData_,
           _MM_HINT_T0);
       _mm_prefetch((char *)(data + 2), _MM_HINT_T0);
+#elif defined(USE_NEON)
+      __builtin_prefetch(
+          data_level0_memory_ + (*(data + 1)) * size_data_per_element_ +
+              offsetData_,
+          0, 3);
+      __builtin_prefetch((char *)(data + 2), 0, 3);
 #endif
 
       for (size_t j = 1; j <= size; j++) {
@@ -1113,6 +1121,12 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
             +
                 offsetData_,
             _MM_HINT_T0);  ////////////
+#elif defined(USE_NEON)
+        __builtin_prefetch(
+            data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_
+            +
+                offsetData_,
+            0, 3);  ////////////
 #endif
         // if (!(visited_array[candidate_id] == visited_array_tag)) {
         if (!vis_hash.CheckAndSet(candidate_id)) {
@@ -1160,6 +1174,12 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
                     candidate_set.top().second * size_data_per_element_ +
                     offsetLevel0_,  ///////////
                 _MM_HINT_T0);       ////////////////////////
+#elif defined(USE_NEON)
+            __builtin_prefetch(
+                data_level0_memory_ +
+                    candidate_set.top().second * size_data_per_element_ +
+                    offsetLevel0_,  ///////////
+                0, 3);       ////////////////////////
 #endif
 
             top_candidates.emplace(dist, candidate_id);
@@ -1515,7 +1535,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
             */
             if (buff_id != -1) {
               // if not local vector.
-              rdma_comm.release_cache(buff_id);
+              rdma_comm.release_cache(buff_id, ThreadPool::getTID());
             }
           }
 
@@ -1547,7 +1567,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
             query.top_candidates.pop();
             if (buff_id != -1) {
               // if not local vector.
-              rdma_comm.release_cache(buff_id);
+              rdma_comm.release_cache(buff_id, ThreadPool::getTID());
             }
           }
 
@@ -1555,7 +1575,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
             query.lowerBound = query.top_candidates.top().dist;
         } else {
           // Case2 : release cache buffer.
-          rdma_comm.release_cache(r.buffer_id);
+          rdma_comm.release_cache(r.buffer_id, r.owner_thread);
         }
       }
     }
@@ -1564,7 +1584,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
       VectorCache<dist_t> rez = query.top_candidates.top();
       query.top_candidates.pop();
       if (rez.buffer_id != -1) {
-        rdma_comm.release_cache(rez.buffer_id);
+        rdma_comm.release_cache(rez.buffer_id, ThreadPool::getTID());
       }
     }
 
@@ -1574,7 +1594,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
           std::pair<dist_t, labeltype>(rez.dist, get_element_label(rez.ptr)));
       query.top_candidates.pop();
       if (rez.buffer_id != -1) {
-        rdma_comm.release_cache(rez.buffer_id);
+        rdma_comm.release_cache(rez.buffer_id, ThreadPool::getTID());
       }
     }
 
@@ -1590,20 +1610,25 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
   void printQueryBatchInfo(float time) {
     float recall = 1.0f * rdma_comm.correct / rdma_comm.total;
     float time_us_per_query = time / rdma_comm.query_load;
-    float avg_lat = rdma_comm.query_lat_sum / rdma_comm.query_load;
+    float avg_lat = rdma_comm.query_lat_sum / rdma_comm.query_load / 1000;
     size_t all_comp_cnt = rdma_comm.all_computation_cnt;
     float qps = 1000000.0 * rdma_comm.query_load / time;
-    // printf("-------------- Overall info --------------\n");
-    // printf(
-    //     "correct: %llu total: %llu query load: %llu\n", rdma_comm.correct,
-    //     rdma_comm.total, rdma_comm.query_load);
+    static bool header_printed = false;
+    if (!header_printed) {
+#ifdef PROF_COMPUTATION
+      printf("ef \t recall \t avg_lat(ms) \t qps \t comp_cnt\n");
+#else
+      printf("ef \t recall \t avg_lat(ms) \t qps\n");
+#endif
+      header_printed = true;
+    }
 #ifdef PROF_COMPUTATION
     printf(
-        "%d \t %.5f \t %.2f \t %.3f \t %llu \n", ef_, recall, avg_lat,
+        "%d \t %.5f \t %.4f \t %.3f \t %llu \n", ef_, recall, avg_lat,
         qps, all_comp_cnt);
 #else   
     printf(
-        "%d \t %.5f \t %.2f \t %.3f \t \n", ef_, recall, avg_lat,
+        "%d \t %.5f \t %.4f \t %.3f \t \n", ef_, recall, avg_lat,
         qps);
 #endif
     
@@ -1613,14 +1638,14 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
   void printQueryBatchInfoSave(float time, std::ofstream &out) {
     float recall = 1.0f * rdma_comm.correct / rdma_comm.total;
     float time_us_per_query = time / rdma_comm.query_load;
-    float avg_lat = rdma_comm.query_lat_sum / rdma_comm.query_load;
+    float avg_lat = rdma_comm.query_lat_sum / rdma_comm.query_load / 1000;
     float qps = 1000000.0 * rdma_comm.query_load / time;
     printf("-------------- Overall info --------------\n");
     printf(
         "correct: %llu total: %llu query load: %llu\n", rdma_comm.correct,
         rdma_comm.total, rdma_comm.query_load);
     printf(
-        "%d \t %.5f \t %.2f \t %.3f \t \n", ef_, recall, avg_lat,
+        "%d \t %.5f \t %.4f \t %.3f \t \n", ef_, recall, avg_lat,
         qps);
     printf("------------------  End ------------------\n");
 
@@ -2007,6 +2032,33 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
     local_cnt = local_deg = remote_cnt = remote_deg = 0;
 #endif
 
+    // ── Deferred query cleanup ────────────────────────────────────
+    // proc_res no longer deletes queries (to avoid dangling pointers
+    // in global_query while other threads process late RDMA results).
+    // Instead, we delete the previous ef's queries here — at a safe
+    // point between ef iterations where all threads are idle and all
+    // termination/standby has completed.
+    for (uint32_t q = 0; q < query_num; q++) {
+      if (global_query[q] != nullptr) {
+        // ~QueryMsg() is empty and never frees the malloc'd vector.
+        free(global_query[q]->vector);
+        delete global_query[q];
+        global_query[q] = nullptr;
+      }
+    }
+
+    // ── Drain stale work-stealing tasks ──────────────────────────
+    // ba_task_queue is a global BalanceQueue shared across all threads.
+    // Tasks pushed by the previous run but never consumed (common when
+    // remote results arrive late and the query terminates before all
+    // steal-able tasks are popped) would otherwise survive into the next
+    // run and accumulate.  This single-threaded call runs at a safe point
+    // (after standby completed, before on_each re-arms workers) so it can
+    // sweep every per-thread queue without races.  Without this drain,
+    // num_runs=10 iterations showed run 6-10 progressively slowing to
+    // 2-3x the median (CV ~38% at 72 threads).
+    ba_task_queue.clearAll();
+
     for (uint32_t q = 0; q < query_num; q++) {
       // Init query.
       global_query[q] = new QueryMsg<dist_t>(
@@ -2176,6 +2228,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
       printf("start new query %u, Pre STAGE\n", query_id);
 #endif
       global_query[query_id]->state = PRE_STAGE;
+      global_query[query_id]->stage_tp = std::chrono::high_resolution_clock::now();
 
 #ifdef PROFILER
       global_query[query_id]->profiler.start("q_pre-stage");
@@ -2284,7 +2337,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
 
       for (uint32_t m = 0; m < MACHINE_NUM; m++) {
         float ratio_m = (float)global_query[query_id]->filter_num[m] / su_cnt;
-        if (ratio_m > 1.0 / (MACHINE_NUM)) {  // core machine ratio bar.
+        if (ratio_m >= 1.0 / (MACHINE_NUM)) {  // core machine ratio bar.
           global_query[query_id]->core_machine.emplace_back(m);
           global_query[query_id]->is_core_machine[m] = 1;
         } else {
@@ -2295,7 +2348,12 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
           }
         }
       }
-
+      // Ensure at least one core machine exists to prevent deadlock when
+      // candidates are evenly distributed (each machine has exactly 1/N ratio).
+      if (global_query[query_id]->core_machine.empty()) {
+        global_query[query_id]->core_machine.emplace_back(mx_mid);
+        global_query[query_id]->is_core_machine[mx_mid] = 1;
+      }
       // Dispatch sub-query: fork query to core machine.
       bool local_is_core = false;
       for (uint32_t &m : global_query[query_id]->core_machine) {
@@ -2308,9 +2366,15 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
             global_query[query_id]->candidate_set.emplace(cand);
           }
         } else {
+          // printf("[DBG-FORK] q%u fork to m%u from m%u\n", query_id, m, (unsigned)rdma_param.machine_id);
           rdma_comm.fork_query(m, global_query[query_id]);
         }
       }
+      // printf("[DBG-DISPATCH] q%u core_machines=%zu local_is_core=%d leader=%u origin=%u\n",
+      //        query_id, global_query[query_id]->core_machine.size(),
+      //        (int)local_is_core,
+      //        global_query[query_id]->leader_machine,
+      //        global_query[query_id]->origin_machine);
       global_query[query_id]->visit_hash.clear();
 
       // Send core machine info to leader machine scheduler.
@@ -2321,6 +2385,14 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
 #ifdef PROFILER
       global_query[query_id]->profiler.end("q_pre-stage");
 #endif
+      // Record PRE_STAGE duration
+      {
+      auto now = std::chrono::high_resolution_clock::now();
+      global_query[query_id]->pre_stage_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(
+      now - global_query[query_id]->stage_tp).count();
+      global_query[query_id]->stage_tp = now;
+      }
 
       if (!local_is_core) {
 #ifdef DEBUG
@@ -2343,6 +2415,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
       printf("recv fork sub-query q%u\n", query_id);
 #endif
       global_query[query_id]->state = PRE_STAGE;
+      global_query[query_id]->stage_tp = std::chrono::high_resolution_clock::now();
     }
 
     // if local machine is core machine.
@@ -2353,6 +2426,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
 #endif
       global_query[query_id]->state = POST_STAGE;
       bool all_result_recved = false;
+      auto sub_tp = std::chrono::high_resolution_clock::now();
       auto &post_cnt = global_query[query_id]->post_cnt;
       auto &recv_cnt = global_query[query_id]->recv_cnt;
       auto &nocore_post = global_query[query_id]->nocore_post;
@@ -2433,9 +2507,20 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
 #endif
           } else {
             all_result_recved = (recv_cnt == post_cnt) && (nocore_post == nocore_recv);
-            // printf(
-            //     "q%d post_cnt %d recv_cnt %d\n", query_id, post_cnt,
-            //     recv_cnt);
+            // // [DEBUG] Periodic log for post/recv counter mismatch
+            // {
+            //   static int _dbg_yield_cnt = 0;
+            //   _dbg_yield_cnt++;
+            //   if (_dbg_yield_cnt % 100 == 0) {
+            //     printf("[DBG-CORO] q%u state=%d post=%u recv=%u npost=%u nrecv=%u cand=%zu top=%zu core_m=%zu leader=%u\n",
+            //            query_id, (int)global_query[query_id]->state,
+            //            post_cnt, recv_cnt, nocore_post, nocore_recv,
+            //            global_query[query_id]->candidate_set.size(),
+            //            global_query[query_id]->top_candidates.size(),
+            //            global_query[query_id]->core_machine.size(),
+            //            global_query[query_id]->leader_machine);
+            //   }
+            // }
 
 #ifdef PROFILER
             m_profiler.end("post_task");
@@ -2462,7 +2547,23 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
             suspend to proc recved remote tasks .
             */
           // printf("post suspend with p %u r %u\n", post_cnt, recv_cnt);
+          // Record DISPATCH time, start YIELD timer
+          {
+            auto now = std::chrono::high_resolution_clock::now();
+            global_query[query_id]->post_dispatch_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(
+            now - sub_tp).count();
+            sub_tp = now;
+          }
           co_yield false;
+          // Record YIELD_WAIT time, start COMPUTE timer
+          {
+            auto now = std::chrono::high_resolution_clock::now();
+            global_query[query_id]->post_yield_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(
+            now - sub_tp).count();
+            sub_tp = now;
+          }
           // printf("q%u search RESUME\n", query_id);
 #ifdef PROFILER
           m_profiler.start("post_stage");
@@ -2527,6 +2628,14 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
             }
             // Use work stealing across threads.
             do_task(task.value());
+          }
+          // Record COMPUTE_LOCAL time, start COMPUTE_REMOTE timer
+          {
+            auto now = std::chrono::high_resolution_clock::now();
+            global_query[query_id]->post_compute_l_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(
+            now - sub_tp).count();
+            sub_tp = now;
           }
 
           for (;;) {
@@ -2600,7 +2709,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
                     global_query[query_id]->vector, vec_ptr, dist_func_param_);
                 post_proc_candidate(dist, ngh_id);
               }
-              rdma_comm.release_cache(r.buffer_id);
+              rdma_comm.release_cache(r.buffer_id, r.owner_thread);
               // free(r);
               recv_cnt++;
               // tman.rpost_async++;
@@ -2648,10 +2757,26 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
 #ifdef PROFILER
           m_profiler.end("post_stage");
 #endif
+          // Record COMPUTE_REMOTE time, restart DISPATCH timer for next iter
+          {
+            auto now = std::chrono::high_resolution_clock::now();
+            global_query[query_id]->post_compute_r_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(
+            now - sub_tp).count();
+            sub_tp = now;
+          }
         }
 
         // local termination, prop token
         // printf("q%u start term\n", query_id);
+        // Record POST_STAGE duration, start TERMINATION timer
+        {
+          auto now = std::chrono::high_resolution_clock::now();
+          global_query[query_id]->post_stage_us +=
+          std::chrono::duration_cast<std::chrono::microseconds>(
+          now - global_query[query_id]->stage_tp).count();
+          global_query[query_id]->stage_tp = now;
+        }
         if (global_query[query_id]->core_machine.size() > 1) {
           if (global_query[query_id]->has_token) {
             // if is leader
@@ -2688,6 +2813,13 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
             global_query[query_id]->sync_step = 0;
           }
           global_query[query_id]->state = PAUSE;
+          // Record TERMINATION duration up to PAUSE point
+          {
+            auto now = std::chrono::high_resolution_clock::now();
+            global_query[query_id]->term_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(
+            now - global_query[query_id]->stage_tp).count();
+          }
           // printf("q%u search PAUSE\n", query_id);
         } else {
           // single core machine, just end.
@@ -2698,8 +2830,15 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
       }
     }
     // printf("search END\n");
+    // Record TERMINATION duration
+    {
+      auto now = std::chrono::high_resolution_clock::now();
+      global_query[query_id]->term_us +=
+      std::chrono::duration_cast<std::chrono::microseconds>(
+      now - global_query[query_id]->stage_tp).count();
+    }
     global_query[query_id]->state = END;
-// printf("q%d over\n", query->query_id);
+    // printf("q%d over\n", query->query_id);
 #ifdef DEBUG
     memset(
         global_query[query_id]->tmp_m_cnt, 0,
@@ -2906,8 +3045,10 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
       for (NodeResult<dist_t> &res_msg : node_res_queue) {
         // printf("proc %d NodeResult ...\n", res_msg.qid);
         if (global_query[res_msg.qid]->state == END) {
-          printf("Error: q%u is END when recv res\n", res_msg.qid);
-          abort();
+          // printf("Error: q%u is END when recv res\n", res_msg.qid);
+          // abort();
+          printf("WARN: q%u is END when recv node_res, discarding\n", res_msg.qid);
+          continue;
         }
         // TODO: can polish here.
         ResultMsg<dist_t> tmp_res_msg(res_msg.qid);
@@ -2920,6 +3061,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
           // printf("voke q%u\n", res_msg.qid);
           subquery_queue.push_back(res_msg.qid);
           global_query[res_msg.qid]->state = POST_STAGE;
+          global_query[res_msg.qid]->stage_tp = std::chrono::high_resolution_clock::now();
         }
       }
       node_res_queue.clear();
@@ -3099,14 +3241,17 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
         } else {
           // printf("push q%u POST STAGE local res\n", res_msg.qid);
           if (global_query[res_msg.qid]->state == END) {
-            printf("WARN: q%u is END when recv res\n", res_msg.qid);
-            abort();
+            // printf("WARN: q%u is END when recv res\n", res_msg.qid);
+            // abort();
+            printf("WARN: q%u is END when recv res, discarding\n", res_msg.qid);
+            continue;
           }
           global_query[res_msg.qid]->local_res.push_back(res_msg);
           if (global_query[res_msg.qid]->state == PAUSE) {
             // printf("voke q%u\n", res_msg.qid);
             subquery_queue.push_back(res_msg.qid);
             global_query[res_msg.qid]->state = POST_STAGE;
+            global_query[res_msg.qid]->stage_tp = std::chrono::high_resolution_clock::now();
           }
           // printf("push q%u post-stage res over\n", res_msg.qid);
         }
@@ -3182,6 +3327,20 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
 #endif
       // printf("tman.cur_query_num %u\n", tman.cur_query_num);
 
+      // // [DEBUG] Periodic state dump for search loop
+      // {
+      //   static thread_local uint64_t _dbg_loop_cnt = 0;
+      //   _dbg_loop_cnt++;
+      //   if (_dbg_loop_cnt % 500000 == 1) {
+      //     printf("[DBG-SEARCH][T%u] qid=%u cur_qnum=%u task=%zu res=%zu query=%zu async=%zu sub=%zu node=%zu cand=%zu state=%d\n",
+      //            (unsigned)ThreadPool::getTID(), qid, tman.cur_query_num,
+      //            task_queue.size(), result_queue.size(), query_queue.size(),
+      //            async_queue.size(), subquery_queue.size(), node_queue.size(),
+      //            global_query[qid] ? global_query[qid]->candidate_set.size() : 0,
+      //            global_query[qid] ? (int)global_query[qid]->state : -1);
+      //   }
+      // }
+
       if (!task_queue.size() && !result_queue.size() && !query_queue.size() &&
           !async_queue.size() && !subquery_queue.size() && !node_queue.size()) {
         if (tman.cur_query_num < QUERY_GROUP_SIZE) {
@@ -3219,6 +3378,18 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
 #else
     rdma_comm.poll_task_result(tman);
 #endif
+
+    // // [DEBUG] Periodic log for wait_finish
+    // {
+    //   static thread_local uint64_t _dbg_wf_cnt = 0;
+    //   _dbg_wf_cnt++;
+    //   if (_dbg_wf_cnt % 500000 == 1) {
+    //     printf("[DBG-WAIT][T%u] qnum=%u task=%zu res=%zu query=%zu async=%zu sub=%zu node=%zu\n",
+    //            (unsigned)ThreadPool::getTID(), tman.cur_query_num,
+    //            task_queue.size(), result_queue.size(), query_queue.size(),
+    //            async_queue.size(), subquery_queue.size(), node_queue.size());
+    //   }
+    // }
 
     if (query_queue.size() || result_queue.size() || task_queue.size() ||
         async_queue.size() || subquery_queue.size() || node_queue.size()) {

@@ -4,6 +4,7 @@
 #include <malloc.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -31,6 +32,37 @@ class OptHashPosVector {
   // [0~m_poolSize + 1) is the first block.
   // [m_poolSize + 1, 2*(m_poolSize + 1)) is the second block;
   std::unique_ptr<SizeType[]> m_hashTable;
+
+  // ── Thread-safety ──────────────────────────────────────────────
+  // visit_hash (an OptHashPosVector inside QueryMsg) is shared across
+  // all threads via global_query[qid].  The coroutine thread calls
+  // CheckAndSet (lines 2554/2628/2657 in scala_search.h) and also pops
+  // tasks from the shared ba_task_queue → do_task → CheckAndSet
+  // (line 2077).  Meanwhile, idle threads call work_steal() → do_task
+  // → CheckAndSet on the *same* query's hash table.
+  //
+  // Without a lock, DoubleSize() can race: two threads concurrently
+  // new[]/unique_ptr.reset() the hash table → use-after-free /
+  // double-free → "malloc(): smallbin double linked list corrupted".
+  // This manifests at higher ef (e.g. 15) where more neighbours are
+  // visited and the initial 32 768-entry table overflows.
+  //
+  // The spinlock is uncontended in the common (no work-steal) path,
+  // so overhead is one atomic xchg + one atomic store per CheckAndSet.
+  mutable std::atomic_flag m_spinlock = ATOMIC_FLAG_INIT;
+
+  inline void lock() const {
+    while (m_spinlock.test_and_set(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+      __builtin_ia32_pause();
+#else
+      __asm__ __volatile__("" ::: "memory");
+#endif
+    }
+  }
+  inline void unlock() const {
+    m_spinlock.clear(std::memory_order_release);
+  }
 
   inline unsigned hash_func2(unsigned idx, int poolSize, int loop) {
     return (idx + loop) & poolSize;
@@ -60,6 +92,7 @@ class OptHashPosVector {
   }
 
   void clear() {
+    lock();
     if (!m_secondHash) {
       // Clear first block.
       memset(m_hashTable.get(), 0, sizeof(SizeType) * (m_poolSize + 1));
@@ -68,6 +101,7 @@ class OptHashPosVector {
       m_secondHash = false;
       memset(m_hashTable.get(), 0, 2 * sizeof(SizeType) * (m_poolSize + 1));
     }
+    unlock();
   }
 
   inline int HashTableExponent() const { return m_exp; }
@@ -78,7 +112,10 @@ class OptHashPosVector {
 
   inline bool CheckAndSet(SizeType idx) {
     // Inner Index is begin from 1
-    return _CheckAndSet(m_hashTable.get(), m_poolSize, true, idx + 1) == 0;
+    lock();
+    int ret = _CheckAndSet(m_hashTable.get(), m_poolSize, true, idx + 1);
+    unlock();
+    return ret == 0;
   }
 
   inline void DoubleSize() {

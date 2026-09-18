@@ -16,6 +16,7 @@ DATA_TYPE="float"
 DISTANCE="l2"
 NODE0_RDMA_IP="${NODE0_RDMA_IP:-33.40.10.121}"
 NODE1_RDMA_IP="${NODE1_RDMA_IP:-}"
+MAX_THREAD_NUM="${MAX_THREAD_NUM:-128}"
 LEADER_IP="${LEADER_IP:-71.54.52.21}"
 MEMCACHED_PORT="${MEMCACHED_PORT:-18516}"
 RDMA_DEVICE="${RDMA_DEVICE:-mlx5_0}"
@@ -25,12 +26,17 @@ THREADS="${THREADS:-8}"
 INDEX_THREADS="${INDEX_THREADS:-$THREADS}"
 RDMA_THREADS="${RDMA_THREADS:-$THREADS}"
 BUILD_JOBS="${BUILD_JOBS:-24}"
+ENABLE_LAT="${ENABLE_LAT:-0}"
 BARRIER_TIMEOUT="${BARRIER_TIMEOUT:-1800}"
 SEARCH_DRAM_GB="${SEARCH_DRAM_GB:-16}"
 BUILD_DRAM_GB="${BUILD_DRAM_GB:-64}"
 MAX_DEGREE="${MAX_DEGREE:-48}"
 BUILD_L="${BUILD_L:-500}"
 RESULT_K="${RESULT_K:-10}"
+# 方法选择：cotra|shard|kshard|single|global (见 arm_roce_8node.sh 注释)
+APP_MODE="${APP_MODE:-cotra}"
+APP_TYPE="${APP_TYPE:-scala_v3}"
+GRAPH_TYPE="${GRAPH_TYPE:-scalagraph_v3}"
 LOCAL_NODE_ID=""
 CMAKE_BIN=""
 CC_BIN=""
@@ -44,6 +50,7 @@ QUERY_DIM=0
 GT_ROWS=0
 GT_K=0
 MILLION=0
+RESULT_QSIZE=""
 
 usage() {
   printf '%s\n' \
@@ -70,7 +77,15 @@ usage() {
     "  --threads N          Set both index and RDMA threads (legacy)." \
     "  --index-threads N    DiskANN/OpenMP build threads. Default: 8" \
     "  --rdma-threads N     CoTra/RDMA worker threads. Default: 8" \
+    "  --max-threads N      Compile-time thread array size cap. Default: 128" \
+    "  --max-degree R       Graph max out-degree (M/R). 8node default: 48" \
+    "  --build-l L          Build queue size / efC. 8node default: 500" \
+    "  --search-dram-gb GB  Search-stage DRAM cap / -B.  Default: 16" \
+    "  --build-dram-gb GB   Build-stage DRAM cap / -M.   Default: 64" \
+    "  --query-size N       Search query count. Default: auto from file header" \
+    "  --res-knn K          Recall@K target. Default: 10" \
     "  --build-jobs N       Parallel compile jobs. Default: 24" \
+    "  --lat                Enable per-query latency measurement (avg_lat column)." \
     "  --gid-index N        Override automatic RoCE GID selection." \
     "  --help               Show this message." \
     "" \
@@ -175,6 +190,10 @@ while (($# > 0)); do
       BUILD_JOBS=${2:?missing value for --build-jobs}
       shift 2
       ;;
+    --lat)
+      ENABLE_LAT=1
+      shift 1
+      ;;
     --gid-index)
       GID_INDEX=${2:?missing value for --gid-index}
       shift 2
@@ -185,6 +204,58 @@ while (($# > 0)); do
       ;;
     --ib-port)
       IB_PORT=${2:?missing value for --ib-port}
+      shift 2
+      ;;
+    --lat)
+      ENABLE_LAT=1
+      shift 1
+      ;;
+    --max-threads)
+      MAX_THREAD_NUM=${2:?missing value for --max-threads}
+      shift 2
+      ;;
+    --max-degree)
+      MAX_DEGREE=${2:?missing value for --max-degree}
+      shift 2
+      ;;
+    --build-l)
+      BUILD_L=${2:?missing value for --build-l}
+      shift 2
+      ;;
+    --search-dram-gb)
+      SEARCH_DRAM_GB=${2:?missing value for --search-dram-gb}
+      shift 2
+      ;;
+    --build-dram-gb)
+      BUILD_DRAM_GB=${2:?missing value for --build-dram-gb}
+      shift 2
+      ;;
+    --query-size)
+      RESULT_QSIZE=${2:?missing value for --query-size}
+      shift 2
+      ;;
+    --res-knn)
+      RESULT_K=${2:?missing value for --res-knn}
+      shift 2
+      ;;
+    --app-mode)
+      APP_MODE=${2:?missing value for --app-mode}
+      case "$APP_MODE" in
+        cotra)   APP_TYPE="scala_v3";        GRAPH_TYPE="scalagraph_v3" ;;
+        shard)   APP_TYPE="b2";              GRAPH_TYPE="shared_nothing" ;;
+        kshard)  APP_TYPE="b2kmeansbatch";   GRAPH_TYPE="shared_nothing" ;;
+        single)  APP_TYPE="single";          GRAPH_TYPE="vamana" ;;
+        global)  APP_TYPE="single";          GRAPH_TYPE="vamana" ;;
+        *) die "unknown --app-mode: $APP_MODE (cotra|shard|kshard|single|global)" ;;
+      esac
+      shift 2
+      ;;
+    --app-type)
+      APP_TYPE=${2:?missing value for --app-type}
+      shift 2
+      ;;
+    --graph-type)
+      GRAPH_TYPE=${2:?missing value for --graph-type}
       shift 2
       ;;
     --help|-h)
@@ -219,6 +290,7 @@ validate_arguments() {
   for pair in \
     "index threads:${INDEX_THREADS}" \
     "RDMA threads:${RDMA_THREADS}" \
+    "max thread cap:${MAX_THREAD_NUM}" \
     "build jobs:${BUILD_JOBS}" \
     "memcached port:${MEMCACHED_PORT}" \
     "IB port:${IB_PORT}" \
@@ -228,9 +300,9 @@ validate_arguments() {
     is_positive_integer "$value" || die "${name} must be a positive integer"
   done
   ((MEMCACHED_PORT <= 65535)) || die "memcached port is too large"
-  ((INDEX_THREADS <= 128)) || die "index threads must not exceed 128"
-  ((RDMA_THREADS <= 128)) ||
-    die "RDMA threads must not exceed COTRA_MAX_THREAD_NUM=128"
+  ((INDEX_THREADS <= MAX_THREAD_NUM)) || die "index threads must not exceed MAX_THREAD_NUM=${MAX_THREAD_NUM}"
+  ((RDMA_THREADS <= MAX_THREAD_NUM)) ||
+    die "RDMA threads must not exceed MAX_THREAD_NUM=${MAX_THREAD_NUM}"
   if [[ -n $GID_INDEX ]]; then
     is_nonnegative_integer "$GID_INDEX" || die "GID index must be non-negative"
   fi
@@ -610,7 +682,8 @@ configure_and_build() {
     -DCMAKE_C_COMPILER="$CC_BIN" \
     -DCMAKE_CXX_COMPILER="$CXX_BIN" \
     -DCOTRA_MACHINE_NUM=2 \
-    -DCOTRA_MAX_THREAD_NUM=128
+    -DCOTRA_MAX_THREAD_NUM=$MAX_THREAD_NUM \
+    ${ENABLE_LAT:+-DCOTRA_LAT=ON}
 
   note "BUILD"
   "$CMAKE_BIN" --build "$BUILD_DIR" -j "$BUILD_JOBS"
@@ -672,7 +745,7 @@ run_index() {
   local command=(
     "${BUILD_DIR}/tests/scala_index"
     --config_file "$CONFIG_FILE"
-    --graph_type scalagraph_v3
+    --graph_type "$GRAPH_TYPE"
     --data_type "$DATA_TYPE"
     --dist_fn "$DISTANCE"
     --data_path "$BASE_FILE"
@@ -712,14 +785,14 @@ run_search() {
   local command=(
     "${BUILD_DIR}/tests/scala_anns"
     --config_file "$CONFIG_FILE"
-    --app_type scala_v3
-    --graph_type scalagraph_v3
+    --app_type "$APP_TYPE"
+    --graph_type "$GRAPH_TYPE"
     --data_type "$DATA_TYPE"
     --dist_fn "$DISTANCE"
     --data_path "$BASE_FILE"
     --query_path "$QUERY_FILE"
     --gt_path "$GT_FILE"
-    --query_size "$QUERY_ROWS"
+    --query_size "${RESULT_QSIZE:-$QUERY_ROWS}"
     --res_knn "$RESULT_K"
     --index_path_prefix "${OUTPUT_DIR}/merged_index"
     -R "$MAX_DEGREE"

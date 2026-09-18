@@ -60,17 +60,37 @@ class BalanceQueue {
     if (ret.has_value()) {
       return ret;
     }
-    // if (getThreadPool().isLeader(tid)) {
-    //   ret = stealOutsideSocket(tid);
-    //   if (ret.has_value()) {
-    //     return ret;
-    //   }
-    // }
-    // ret = stealOutsideSocket(tid);
-    // if (ret.has_value()) {
-    //   return ret;
-    // }
-
+    // Cross-NUMA task stealing is a major source of run-to-run QPS variance
+    // at >=48 threads.  stealOutsideSocket() walks every other socket's
+    // per-thread queue and calls LockFreeQueue::pop() on each, which is
+    // actually a mutex-guarded std::queue (see lockfreeQ.h).  At 72 threads
+    // across 3 NUMA nodes this produces heavy cross-NUMA lock contention
+    // (~200ns per remote lock vs ~30ns local), and the contention pattern
+    // shifts randomly per run as the load-balancer dispatch order varies.
+    // Combined with the exec_query.h implicit barrier (batch time = max
+    // thread time), one thread stalling on a remote lock stalls the whole
+    // batch -> high CV.
+    //
+    // Disabling cross-NUMA steal trades occasional idle stalls on a
+    // partially-loaded NUMA node for dramatically lower variance.  Within-
+    // socket stealing (stealWithinSocket above) is retained and is itself
+    // sufficient for 8/12/24 threads (single NUMA) where it never crosses
+    // a NUMA boundary.
+    //
+    // Re-enable to experiment with cross-NUMA load balancing:
+    //   g++ -DCOTRA_STEAL_CROSS_NUMA ...
+#ifdef COTRA_STEAL_CROSS_NUMA
+    if (getThreadPool().isLeader(tid)) {
+      ret = stealOutsideSocket(tid);
+      if (ret.has_value()) {
+        return ret;
+      }
+    }
+    ret = stealOutsideSocket(tid);
+    if (ret.has_value()) {
+      return ret;
+    }
+#endif
     return std::nullopt;
   }
 
@@ -105,5 +125,23 @@ class BalanceQueue {
       return trySteal(ThreadPool::getTID());
     }
     return std::nullopt;
+  }
+
+  // Clear every per-thread queue.  MUST be called from a single thread at a
+  // safe point where all worker threads are idle (no concurrent push/pop/steal)
+  // — i.e. between ef iterations in scala_search_init, after the previous
+  // run's termination/standby has fully completed.
+  //
+  // Without this, tasks pushed by a previous run but never stolen/consumed
+  // (common in distributed search when remote results arrive late) survive
+  // into the next run and accumulate.  Across num_runs=10 iterations this
+  // accumulation produces the "runs 6-10 progressively slower" pattern
+  // (median time grows 2-3x), giving CV ~38% at 72 threads.
+  void clearAll() {
+    auto &tp = getThreadPool();
+    const unsigned maxT = tp.getMaxThreads();
+    for (unsigned t = 0; t < maxT; ++t) {
+      task_queue.getRemote(t)->clear();
+    }
   }
 };

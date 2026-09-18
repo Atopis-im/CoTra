@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
           //   printf("\n");
           //   abort();
           // }
-          rdma_comm.release_cache(r.buffer_id);
+          rdma_comm.release_cache(r.buffer_id, r.owner_thread);
         }
       }
       profiler.end(name);

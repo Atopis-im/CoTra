@@ -1,5 +1,7 @@
 #include "index/index_param.h"
 
+#include <sstream>
+
 #include "anns/anns_param.h"
 #include "diskann/include/program_options_utils.hpp"
 
@@ -7,6 +9,7 @@ AnnsParameter::AnnsParameter(int argc, char **argv, IndexParameter &index_param)
 
   po::options_description desc{program_options_utils::make_program_description(
       "build_disk_index", "Build a disk-based index.")};
+  po::variables_map vm;  // declared outside try so we can read it below
   try {
     desc.add_options()("help,h", "Print information on arguments");
 
@@ -61,6 +64,22 @@ AnnsParameter::AnnsParameter(int argc, char **argv, IndexParameter &index_param)
     optional_configs.add_options()(
         "query_size,Q", po::value<size_t>(&qsize)->default_value(10000),
         "default query size is 10000");
+
+    optional_configs.add_options()(
+        "search_ef_list",
+        po::value<std::string>()->default_value(""),
+        "Comma-separated ef values to sweep during search, e.g. \"50,100,200\". "
+        "When empty, uses the built-in default list.");
+
+    optional_configs.add_options()(
+        "warmup_runs", po::value<int>()->default_value(1),
+        "Number of untimed warmup passes before timed measurement (default 1, 0=skip).");
+    optional_configs.add_options()(
+        "warmup_ef", po::value<size_t>()->default_value(0),
+        "ef for warmup passes (0 = use max ef from --search_ef_list).");
+    optional_configs.add_options()(
+        "num_runs", po::value<int>()->default_value(10),
+        "Timed measurement repetitions per ef point; QPS reported as median (default 10, 1=old behaviour).");
     
     optional_configs.add_options()(
         "scala_v3", po::bool_switch()->default_value(false), "Search version");
@@ -68,12 +87,10 @@ AnnsParameter::AnnsParameter(int argc, char **argv, IndexParameter &index_param)
     desc.add(required_configs).add(optional_configs);
     
 
-    po::variables_map vm;
-    auto parsed = po::command_line_parser(argc, argv)
+    po::store(po::command_line_parser(argc, argv)
           .options(desc)
           .allow_unregistered()
-          .run();
-    po::store(parsed, vm);
+          .run(), vm);
     
     // po::store(po::parse_command_line(argc, argv, desc, po::command_line_style::allow_unregistered), vm);
     if (vm.count("help")) {
@@ -84,6 +101,54 @@ AnnsParameter::AnnsParameter(int argc, char **argv, IndexParameter &index_param)
   } catch (const std::exception &ex) {
     std::cerr << ex.what() << '\n';
     abort();
+  }
+
+  // Parse --search_ef_list (comma-separated) into search_ef_list.
+  // Empty/unset → leave vector empty → exec_query.h uses built-in default.
+  {
+    std::string ef_str = vm["search_ef_list"].as<std::string>();
+    if (!ef_str.empty()) {
+      std::stringstream ss(ef_str);
+      std::string token;
+      while (std::getline(ss, token, ',')) {
+        // trim whitespace
+        size_t a = token.find_first_not_of(" \t");
+        size_t b = token.find_last_not_of(" \t");
+        if (a == std::string::npos) continue;
+        std::string trimmed = token.substr(a, b - a + 1);
+        if (trimmed.empty()) continue;
+        try {
+          size_t val = std::stoull(trimmed);
+          if (val == 0) {
+            std::cerr << "Error: --search_ef_list contains 0 (must be >= 1)\n";
+            abort();
+          }
+          search_ef_list.push_back(val);
+        } catch (const std::exception &e) {
+          std::cerr << "Error parsing --search_ef_list token '" << trimmed
+                    << "': " << e.what() << "\n";
+          abort();
+        }
+      }
+      if (search_ef_list.empty()) {
+        std::cerr << "Error: --search_ef_list specified but no valid values parsed\n";
+        abort();
+      }
+      printf("Search ef list (from CLI):");
+      for (size_t v : search_ef_list) printf(" %zu", v);
+      printf("\n");
+    }
+  }
+
+  // Parse warmup / repeat parameters.
+  {
+    warmup_runs = vm["warmup_runs"].as<int>();
+    warmup_ef   = vm["warmup_ef"].as<size_t>();
+    num_runs    = vm["num_runs"].as<int>();
+    if (num_runs < 1)    num_runs = 1;
+    if (warmup_runs < 0) warmup_runs = 0;
+    printf("Measurement: warmup_runs=%d  warmup_ef=%zu  num_runs=%d\n",
+           warmup_runs, warmup_ef, num_runs);
   }
 
   machine_id = get_machine_id(config_file);
