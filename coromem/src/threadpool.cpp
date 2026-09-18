@@ -79,13 +79,32 @@ void ThreadPool::destroyCommon() {
   run(mi.maxThreads, []() { throw shutdown_ty(); });
 }
 
+// void ThreadPool::initThread(unsigned tid) {
+//   signals[tid] = &thd_info;
+//   thd_info.topo = getHWTopo().threadTopoInfo[tid];
+//   // Initialize
+//   initPTS(mi.maxThreads);
+
+//   bindThreadSelf(thd_info.topo.osContext);
+//   thd_info.done = 1;
+// }
+
 void ThreadPool::initThread(unsigned tid) {
   signals[tid] = &thd_info;
   thd_info.topo = getHWTopo().threadTopoInfo[tid];
+  // Bind to the target NUMA core BEFORE allocating per-thread storage.
+  // initPTS() calls allocPages() + memset(), and Linux's default NUMA
+  // policy is first-touch: physical pages land on the NUMA node of the
+  // CPU executing the memset.  If we allocate before binding, worker
+  // threads (which inherit the main thread's node0 affinity at birth)
+  // first-touch all their buffers on node0, leaving ~6GB of per-thread
+  // RDMA/task storage stranded on node0 even after they migrate to
+  // node1/2/3.  Binding first makes the first-touch land on the thread's
+  // own NUMA node, giving correct NUMA locality for the buffers.
+  bindThreadSelf(thd_info.topo.osContext);
+
   // Initialize
   initPTS(mi.maxThreads);
-
-  bindThreadSelf(thd_info.topo.osContext);
   thd_info.done = 1;
 }
 

@@ -16,6 +16,7 @@
 // #define PROF_ALL_Q_DISTRI
 
 // #define LAT
+#define LAT
 // #define PROFILER
 // #define COMM_PROFILE
 
@@ -50,6 +51,9 @@ typedef enum {
 #define USE_AVX512
 #endif
 #endif
+#endif
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#define USE_NEON
 #endif
 #endif
 
@@ -138,6 +142,14 @@ static bool AVX512Capable() {
   }
   return HW_AVX512F && avx512Supported;
 }
+#endif
+
+#if defined(USE_NEON)
+#include <arm_neon.h>
+// All ARMv8+ aarch64 cores support NEON and the floating-point FMLA/FMADD
+// instructions, so there is no runtime capability check needed (unlike x86
+// where AVX support must be probed via cpuid).  The compiler guards this
+// translation unit with __ARM_NEON/__aarch64__ already.
 #endif
 
 #include <string.h>

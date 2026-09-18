@@ -1,7 +1,57 @@
 #pragma once
 #include "search_interface.h"
+#include <atomic>
+#include <cstdint>
 
 namespace hnswlib {
+
+// ── 距离计算次数统计 (线程安全, 覆盖 cotra + shard 两种模式) ──────────────
+// 每次 L2 距离函数被调用 = 对一个邻居/候选算了一次距离.  HNSW 搜索时,
+// 入口点 / 上层下降 / 基底层候选评估 全都走 fstdistfunc_, 因此在这个
+// "漏斗点" 计数 = 真实的距离计算次数 = 评估的邻居数 (二者是同一个数).
+//
+// 性能注意: 距离计算是最内层热循环, 不能用单一全局 atomic 计数:
+// 所有线程 fetch_add 同一个变量会让 cache line 在核间不停弹跳,
+// 高线程数下 QPS 掉 ~3x (实测 48 线程: 18580 vs 67914).
+// 改用 per-thread slot: 每线程独占一个 64B 对齐的槽位, 计数时只碰
+// 自己的 cache line (无争用), 读取时把所有 slot 求和.
+inline constexpr int kMaxDistCounterSlots = 512;
+struct alignas(64) PaddedDistCounter {
+  std::atomic<uint64_t> v{0};
+  char pad_[64 - sizeof(std::atomic<uint64_t>)];
+};
+inline PaddedDistCounter g_l2_dist_slots[kMaxDistCounterSlots];
+inline std::atomic<int> g_l2_dist_next_slot{0};
+inline thread_local int t_l2_dist_slot = -1;
+
+// 真实距离函数指针 (运行期选定, 取决于维度/SIMD 变体).  仅在 L2Space
+// 构造时写入一次, 之后只读; 进程内通常只有一个 L2Space, 无覆盖风险.
+inline DISTFUNC<float> g_real_l2_fn = nullptr;
+
+// 计数包装器: +1 后转发给真实函数.  inline 保证跨 TU 唯一.
+inline float L2CountingWrapper(const void *a, const void *b, const void *p) {
+  if (t_l2_dist_slot < 0) {  // 首次调用: 领取一个 slot (每线程仅一次)
+    t_l2_dist_slot = g_l2_dist_next_slot.fetch_add(1, std::memory_order_relaxed);
+    if (t_l2_dist_slot >= kMaxDistCounterSlots)  // 防御: 超限时共享最后一个
+      t_l2_dist_slot = kMaxDistCounterSlots - 1;
+  }
+  g_l2_dist_slots[t_l2_dist_slot].v.fetch_add(1, std::memory_order_relaxed);
+  return g_real_l2_fn(a, b, p);
+}
+
+// 聚合所有 slot.  调用点(do_all/on_each 结束后)与 worker 写入之间
+// 存在 join 同步, happens-before 成立, relaxed 读足够.
+inline uint64_t l2_dist_computations_total() {
+  uint64_t sum = 0;
+  for (int i = 0; i < kMaxDistCounterSlots; ++i)
+    sum += g_l2_dist_slots[i].v.load(std::memory_order_relaxed);
+  return sum;
+}
+
+inline void l2_dist_computations_reset() {
+  for (int i = 0; i < kMaxDistCounterSlots; ++i)
+    g_l2_dist_slots[i].v.store(0, std::memory_order_relaxed);
+}
 
 static float L2Sqr(
     const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
@@ -205,6 +255,112 @@ static float L2SqrSIMD4ExtResiduals(
 }
 #endif
 
+#if defined(USE_NEON)
+
+// NEON processes 4 floats per lane (128-bit).  We unroll 4x to match the
+// 16-element granularity of the x86 SIMD16Ext variants so that dim%16==0
+// vectors (e.g. laion-512d) take the same fast path.  Fused multiply-add
+// (vfmaq_f32) is used because ARMv8 guarantees its availability.
+static float L2SqrSIMD16ExtNEON(
+    const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
+  float *pVect1 = (float *)pVect1v;
+  float *pVect2 = (float *)pVect2v;
+  size_t qty = *((size_t *)qty_ptr);
+  size_t qty16 = qty >> 4;
+
+  const float *pEnd1 = pVect1 + (qty16 << 4);
+
+  float32x4_t sum = vdupq_n_f32(0);
+
+  while (pVect1 < pEnd1) {
+    float32x4_t v1, v2, diff;
+    v1 = vld1q_f32(pVect1);
+    v2 = vld1q_f32(pVect2);
+    diff = vsubq_f32(v1, v2);
+    sum = vfmaq_f32(sum, diff, diff);
+    pVect1 += 4;
+    pVect2 += 4;
+
+    v1 = vld1q_f32(pVect1);
+    v2 = vld1q_f32(pVect2);
+    diff = vsubq_f32(v1, v2);
+    sum = vfmaq_f32(sum, diff, diff);
+    pVect1 += 4;
+    pVect2 += 4;
+
+    v1 = vld1q_f32(pVect1);
+    v2 = vld1q_f32(pVect2);
+    diff = vsubq_f32(v1, v2);
+    sum = vfmaq_f32(sum, diff, diff);
+    pVect1 += 4;
+    pVect2 += 4;
+
+    v1 = vld1q_f32(pVect1);
+    v2 = vld1q_f32(pVect2);
+    diff = vsubq_f32(v1, v2);
+    sum = vfmaq_f32(sum, diff, diff);
+    pVect1 += 4;
+    pVect2 += 4;
+  }
+
+  // horizontal add of the 4 lanes
+  float32x2_t sum2 = vadd_f32(vget_high_f32(sum), vget_low_f32(sum));
+  return vget_lane_f32(vpadd_f32(sum2, sum2), 0);
+}
+
+static float L2SqrSIMD4ExtNEON(
+    const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
+  float *pVect1 = (float *)pVect1v;
+  float *pVect2 = (float *)pVect2v;
+  size_t qty = *((size_t *)qty_ptr);
+
+  size_t qty4 = qty >> 2;
+  const float *pEnd1 = pVect1 + (qty4 << 2);
+
+  float32x4_t sum = vdupq_n_f32(0);
+
+  while (pVect1 < pEnd1) {
+    float32x4_t v1 = vld1q_f32(pVect1);
+    float32x4_t v2 = vld1q_f32(pVect2);
+    float32x4_t diff = vsubq_f32(v1, v2);
+    sum = vfmaq_f32(sum, diff, diff);
+    pVect1 += 4;
+    pVect2 += 4;
+  }
+
+  float32x2_t sum2 = vadd_f32(vget_high_f32(sum), vget_low_f32(sum));
+  return vget_lane_f32(vpadd_f32(sum2, sum2), 0);
+}
+
+static float L2SqrSIMD16ExtNEONResiduals(
+    const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
+  size_t qty = *((size_t *)qty_ptr);
+  size_t qty16 = qty >> 4 << 4;
+  float res = L2SqrSIMD16ExtNEON(pVect1v, pVect2v, &qty16);
+  float *pVect1 = (float *)pVect1v + qty16;
+  float *pVect2 = (float *)pVect2v + qty16;
+
+  size_t qty_left = qty - qty16;
+  float res_tail = L2Sqr(pVect1, pVect2, &qty_left);
+  return (res + res_tail);
+}
+
+static float L2SqrSIMD4ExtNEONResiduals(
+    const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
+  size_t qty = *((size_t *)qty_ptr);
+  size_t qty4 = qty >> 2 << 2;
+
+  float res = L2SqrSIMD4ExtNEON(pVect1v, pVect2v, &qty4);
+  size_t qty_left = qty - qty4;
+
+  float *pVect1 = (float *)pVect1v + qty4;
+  float *pVect2 = (float *)pVect2v + qty4;
+  float res_tail = L2Sqr(pVect1, pVect2, &qty_left);
+
+  return (res + res_tail);
+}
+#endif
+
 class L2Space : public SpaceInterface<float> {
   DISTFUNC<float> fstdistfunc_;
   size_t data_size_;
@@ -231,9 +387,26 @@ class L2Space : public SpaceInterface<float> {
       fstdistfunc_ = L2SqrSIMD16ExtResiduals;
     else if (dim > 4)
       fstdistfunc_ = L2SqrSIMD4ExtResiduals;
+#elif defined(USE_NEON)
+    // ARM NEON path: 128-bit vectors (4 floats/lane), unrolled 4x for the
+    // 16-element fast path.  No runtime capability probe needed on aarch64.
+    if (dim % 16 == 0)
+      fstdistfunc_ = L2SqrSIMD16ExtNEON;
+    else if (dim % 4 == 0)
+      fstdistfunc_ = L2SqrSIMD4ExtNEON;
+    else if (dim > 16)
+      fstdistfunc_ = L2SqrSIMD16ExtNEONResiduals;
+    else if (dim > 4)
+      fstdistfunc_ = L2SqrSIMD4ExtNEONResiduals;
 #endif
     dim_ = dim;
     data_size_ = dim * sizeof(float);
+
+    // 包一层计数器: 之后所有 fstdistfunc_(...) 调用都会 +1 计入
+    // per-thread slot (见文件头).  开销: thread_local 分支 + 无争用
+    // relaxed atomic + 一次间接调用 (原本就是函数指针, 无内联损失).
+    g_real_l2_fn = fstdistfunc_;
+    fstdistfunc_ = L2CountingWrapper;
   }
 
   size_t get_data_size() { return data_size_; }

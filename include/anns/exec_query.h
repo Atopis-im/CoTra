@@ -2,12 +2,14 @@
 
 #include <omp.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <queue>
 #include <unordered_set>
-#include <chrono>
+#include <vector>
 
 #include "anns/scala_search.h"
 #include "coromem/include/galois/bag.h"
@@ -38,13 +40,21 @@ static void test_vs_recall(
 #ifdef DEBUG
   vector<size_t> efs = {30, 400};
 #else
-  // repeat first for warmup.
-  vector<size_t> efs = {3, 4, 5, 6, 8, 10, 15, 20, 30, 40, 50, 70, 100, 150, 200, 250, 300, 400, 500, 600, 700};
+  // Use CLI-provided --search_ef_list when available; otherwise fall back
+  // to the built-in default sweep list.
+  vector<size_t> efs = anns_param.search_ef_list.empty()
+      ? vector<size_t>{3, 4, 5, 6, 8, 10, 15, 20, 30, 40, 50, 70, 100, 150, 200, 250, 300, 400, 500, 600, 700}
+      : anns_param.search_ef_list;
 #endif
 
 #if defined(PROF_Q_DISTRI) || defined(PROF_ALL_Q_DISTRI)
   efs = {300};
 #endif
+
+  // Warmup is performed once, on the first ef iteration inside the
+  // ScalaANN_v3 case.  This flag prevents it from running again on
+  // subsequent ef values.
+  bool warmup_done = false;
 
   for (size_t ef : efs) {
     appr_alg.set_ef(ef);
@@ -128,12 +138,12 @@ static void test_vs_recall(
             },
             no_stats(), loopname("Reset"));
         float recall = 1.0f * correct.load() / total.load();
-        float time_us_per_query = stopw.getElapsedTimeMicro() / query_load;
+        float time_ms_per_query = stopw.getElapsedTimeMicro() / query_load / 1000.0f;
         float qps = 1000000.0 * query_load / stopw.getElapsedTimeMicro();
-        cout << ef << "\t" << recall << "\t" << time_us_per_query << " us\t"
+        cout << ef << "\t" << recall << "\t" << time_ms_per_query << " ms\t"
              << qps << " /s\n";
         if (recall > 1.0) {
-          cout << recall << "\t" << time_us_per_query << " us\n";
+          cout << recall << "\t" << time_ms_per_query << " ms\n";
           break;
         }
 
@@ -203,12 +213,12 @@ static void test_vs_recall(
           appr_alg.printQueryBatchInfo(stopw.getElapsedTimeMicro());
         }
         float recall = 1.0f * correct.load() / total.load();
-        float time_us_per_query = stopw.getElapsedTimeMicro() / query_load;
+        float time_ms_per_query = stopw.getElapsedTimeMicro() / query_load / 1000.0f;
         float qps = 1000000.0 * query_load / stopw.getElapsedTimeMicro();
-        cout << ef << "\t" << recall << "\t" << time_us_per_query << " us\t"
+        cout << ef << "\t" << recall << "\t" << time_ms_per_query << " ms\t"
              << qps << " /s\n";
         if (recall > 1.0) {
-          cout << recall << "\t" << time_us_per_query << " us\n";
+          cout << recall << "\t" << time_ms_per_query << " ms\n";
           break;
         }
 
@@ -224,76 +234,211 @@ static void test_vs_recall(
         on_each(all);
         query_load = qsize;
 
-        double cumu_lat_us = 0.0;
-        double avg_lat_us = 0.0;
-
-        StopW stopw = StopW();
-        if (appr_alg.rdma_param.machine_id == 0) {
-          // baseline2 leader
-          do_all(
-              iterate(all),
-              [&](const uint32 &i) {
-                // Send query to other machines ...
-                appr_alg.dispatch_query(query_ptr + vecsize * i, i, k);
-                // here to change
-                std::priority_queue<std::pair<dist_t, labeltype>> result =
-                    appr_alg.localSearchKnn(query_ptr + vecsize * i, k);
-
-                std::priority_queue<std::pair<dist_t, labeltype>>
-                    sub_result[MACHINE_NUM];
-
-                appr_alg.collect_query(result, k, sub_result);
-
-                std::priority_queue<std::pair<dist_t, labeltype>> gt(answers[i]);
-                unordered_set<labeltype> g;
-                total.fetch_add(gt.size());
-#ifdef DEBUG
-                std::cout << "gt: \n ";
-#endif
-                while (gt.size()) {
-                  g.insert(gt.top().second);
-#ifdef DEBUG
-                  std::cout << gt.top().second << " ";
-#endif
-                  gt.pop();
-                }
-#ifdef DEBUG
-                std::cout << "\n ";
-#endif
-                while (result.size()) {
-                  if (g.find(result.top().second) != g.end()) {
-                    correct.fetch_add(1);
-                  } else {
-                  }
-                  result.pop();
-                }
-              },
-              no_stats(), loopname("Reset"));
-
-          avg_lat_us = cumu_lat_us/query_load;
-        } else {
-          // baseline2 member
-          on_each(
-              [&](uint64 tid, uint64 total) {
-                for (;;) {
-                  // Send query to other machines ...
-                  appr_alg.dispatch_query(query_ptr + vecsize * tid, 0, k);
-
-                  std::priority_queue<std::pair<dist_t, labeltype>> result =
-                      appr_alg.localSearchKnn(query_ptr + vecsize * tid, k);
-
-                  appr_alg.collect_query(result, k);
-                }
-              },
-              no_stats(), loopname("Reset"));
+        // B2 终止协议说明: warmup 与正式测量每轮都靠 initTerm/sendTerm/
+        // termStandBy 完成全局同步 (member 的 for(;;) 靠 term 信号退出).
+        //
+        // ── Warmup (runs once, on first ef iteration) ──────────────
+        // 与 cotra(ScalaANN_v3) 路径口径对齐: 正式计时前先预热 page table /
+        // TLB / CPU cache / RDMA qp 路径, 使 B2 的 QPS 与 cotra 可公平比较.
+        // warmup 不计时、不计距离、不累加 correct/total.
+        if (!warmup_done && anns_param.warmup_runs > 0) {
+          size_t w_ef = anns_param.warmup_ef > 0
+                            ? anns_param.warmup_ef
+                            : efs.back();
+          size_t saved_ef = ef;
+          appr_alg.set_ef(w_ef);
+          if (appr_alg.rdma_param.machine_id == 0)
+            printf("Warmup(B2): %d pass(es) at ef=%zu ...\n",
+                   anns_param.warmup_runs, w_ef);
+          for (int w = 0; w < anns_param.warmup_runs; ++w) {
+            appr_alg.initTerm();
+            if (appr_alg.rdma_param.machine_id == 0) {
+              do_all(
+                  iterate(all),
+                  [&](const uint32 &i) {
+                    appr_alg.dispatch_query(query_ptr + vecsize * i, i, k);
+                    std::priority_queue<std::pair<dist_t, labeltype>> result =
+                        appr_alg.localSearchKnn(query_ptr + vecsize * i, k);
+                    std::priority_queue<std::pair<dist_t, labeltype>>
+                        sub_result[MACHINE_NUM];
+                    appr_alg.collect_query(result, k, sub_result);
+                  },
+                  no_stats(), loopname("Warmup"));
+              appr_alg.sendTerm(0, 0, query_load);
+            } else {
+              on_each(
+                  [&](uint64 tid, uint64 total) {
+                    for (;;) {
+                      if (!appr_alg.dispatch_query(query_ptr + vecsize * tid, 0, k)) {
+                        break;
+                      }
+                      std::priority_queue<std::pair<dist_t, labeltype>> result =
+                          appr_alg.localSearchKnn(query_ptr + vecsize * tid, k);
+                      appr_alg.collect_query(result, k);
+                    }
+                  },
+                  no_stats(), loopname("Warmup"));
+              appr_alg.sendTerm(0, 0, query_load);
+            }
+            appr_alg.termStandBy(k);
+          }
+          appr_alg.set_ef(saved_ef);
+          warmup_done = true;
+          if (appr_alg.rdma_param.machine_id == 0)
+            printf("Warmup(B2) done.\n");
         }
+
+        // ── Repeated measurement runs ──────────────────────────────
+        // 跑 num_runs 轮, 每轮记墙钟时间, 报 median QPS (与 cotra 一致).
+        // correct/total 取最后一轮值 (确定性); avg_lat 取最后一轮累计.
+        std::vector<double> run_times;
+        int num_runs = anns_param.num_runs > 0 ? anns_param.num_runs : 1;
+        double avg_lat_us = 0.0;  // 最后一轮的 avg latency (us)
+
+        for (int r = 0; r < num_runs; ++r) {
+          correct.store(0, std::memory_order_relaxed);
+          total.store(0, std::memory_order_relaxed);
+          appr_alg.initTerm();
+
+          bool is_last_run = (r == num_runs - 1);
+          // 距离计算次数: 只在最后一轮清零, 使读出的值 = 最后一轮单轮累计
+          // (与 cotra 口径一致: 单轮值, 非 num_runs 累加)
+          if (is_last_run) {
+            appr_alg.resetDistComputations();
+          }
+
+          // Per-query latency accumulator (atomic: do_all may parallelize).
+          std::atomic<uint64_t> total_lat_us{0};
+
+          StopW stopw = StopW();
+          if (appr_alg.rdma_param.machine_id == 0) {
+            // baseline2 leader
+            do_all(
+                iterate(all),
+                [&](const uint32 &i) {
+                  auto q_start = std::chrono::high_resolution_clock::now();
+                  // Send query to other machines ...
+                  appr_alg.dispatch_query(query_ptr + vecsize * i, i, k);
+                  // here to change
+                  std::priority_queue<std::pair<dist_t, labeltype>> result =
+                      appr_alg.localSearchKnn(query_ptr + vecsize * i, k);
+
+                  std::priority_queue<std::pair<dist_t, labeltype>>
+                      sub_result[MACHINE_NUM];
+
+                  appr_alg.collect_query(result, k, sub_result);
+
+                  std::priority_queue<std::pair<dist_t, labeltype>> gt(answers[i]);
+                  unordered_set<labeltype> g;
+                  total.fetch_add(gt.size());
+#ifdef DEBUG
+                  std::cout << "gt: \n ";
+#endif
+                  while (gt.size()) {
+                    g.insert(gt.top().second);
+#ifdef DEBUG
+                    std::cout << gt.top().second << " ";
+#endif
+                    gt.pop();
+                  }
+#ifdef DEBUG
+                  std::cout << "\n ";
+#endif
+                  while (result.size()) {
+                    if (g.find(result.top().second) != g.end()) {
+                      correct.fetch_add(1);
+                    } else {
+                    }
+                    result.pop();
+                  }
+                  auto q_end = std::chrono::high_resolution_clock::now();
+                  total_lat_us.fetch_add(
+                      (uint64_t)duration_cast<std::chrono::microseconds>(
+                          q_end - q_start)
+                          .count(),
+                      std::memory_order_relaxed);
+                },
+                no_stats(), loopname("Reset"));
+
+            if (is_last_run)
+              avg_lat_us = (double)total_lat_us.load() / query_load;
+
+            // leader 跑完所有 query, 广播 term 给所有 member
+            appr_alg.sendTerm(correct.load(), total.load(), query_load);
+          } else {
+            // baseline2 member
+            on_each(
+                [&](uint64 tid, uint64 total) {
+                  for (;;) {
+                    // dispatch_query 返回 false = 收到 leader 的 term, 退出循环
+                    if (!appr_alg.dispatch_query(query_ptr + vecsize * tid, 0, k)) {
+                      break;
+                    }
+
+                    std::priority_queue<std::pair<dist_t, labeltype>> result =
+                        appr_alg.localSearchKnn(query_ptr + vecsize * tid, k);
+
+                    appr_alg.collect_query(result, k);
+                  }
+                },
+                no_stats(), loopname("Reset"));
+
+            // member 退出循环后也发 term 给 leader (对称终止)
+            appr_alg.sendTerm(correct.load(), total.load(), query_load);
+          }
+          // 所有节点都发完 term 后, 等齐 (确保 term 信号被各方收到)
+          appr_alg.termStandBy(k);
+
+          float exec_time = stopw.getElapsedTimeMicro();
+          run_times.push_back(exec_time);
+        }  // end for (r = 0 .. num_runs)
+
+        // ── Median QPS output (after all runs) ────────────────────
+        // recall / avg_lat 取最后一轮值 (确定性). QPS 用 median 墙钟时间
+        // 抗抖动 (与 cotra 一致).
+        std::sort(run_times.begin(), run_times.end());
+        double median_time = run_times[run_times.size() / 2];
+        double min_time = run_times.front();
+        double max_time = run_times.back();
+
         float recall = 1.0f * correct.load() / total.load();
-        float time_us_per_query = stopw.getElapsedTimeMicro() / query_load;
-        float qps = 1000000.0 * query_load / stopw.getElapsedTimeMicro();
-        cout << ef << "\t" << recall << "\t" << avg_lat_us << " us\t"
-             << qps << " /s\n";
+        float avg_lat_ms = avg_lat_us / 1000.0;
+
+        if (appr_alg.rdma_param.machine_id == 0) {
+          // B2: 每节点处理全部 qsize 个 query, 故分子用本地 query_load(=qsize),
+          // 不用 rdma_comm.query_load(=8*qsize, 会偏高 8 倍).
+          float med_qps = 1000000.0f * query_load / median_time;
+          float min_qps = 1000000.0f * query_load / max_time;
+          float max_qps = 1000000.0f * query_load / min_time;
+          printf("[B2 runs=%d] median_qps=%.3f  min_qps=%.3f  max_qps=%.3f\n",
+                 num_runs, med_qps, min_qps, max_qps);
+          printf("  run_times(ms):");
+          for (double t : run_times) printf(" %.1f", t / 1000.0);
+          printf("\n");
+          // 兼容原格式输出 (ef recall avg_lat qps), 用 median 时间
+          float time_ms_per_query = median_time / query_load / 1000.0f;
+          cout << ef << "\t" << recall << "\t" << avg_lat_ms << " ms\t"
+               << med_qps << " /s\n";
+          (void)time_ms_per_query;
+        } else {
+          float qps = 1000000.0 * query_load / median_time;
+          static bool header_printed = false;
+          if (!header_printed) {
+            cout << "ef"
+                 << "\t"
+                 << "recall"
+                 << "\t"
+                 << "time_per_query(ms)"
+                 << "\t"
+                 << "qps"
+                 << "\n";
+            header_printed = true;
+          }
+          cout << ef << "\t" << recall << "\t" << avg_lat_ms << " ms\t"
+               << qps << " /s\n";
+        }
         if (recall > 1.0) {
-          cout << recall << "\t" << avg_lat_us << " us\n";
+          cout << recall << "\t" << avg_lat_ms << " ms\n";
           break;
         }
 
@@ -302,6 +447,28 @@ static void test_vs_recall(
           << appr_alg.computation_cnt/query_load << "\n";
         appr_alg.computation_cnt = 0;
 #endif
+
+        // ── 距离计算次数 / 评估的邻居数 (ndis) ── [shard / B2]
+        // HNSW 中每次 fstdistfunc_ 调用 = 对一个邻居算一次距离, 故
+        // "距离计算次数" == "评估的邻居数", 是同一个数.
+        // shard(B2): query_load = qsize, 每个节点处理全部 qsize 个 query.
+        //   本机 avg/query = dist_cnt / qsize.
+        //   全局 avg/query = Σ各节点 dist_cnt / qsize = Σ各节点 avg/query.
+        //   term 协议已聚合 all_computation_cnt = Σ各节点 dist_cnt (精确,
+        //   因为 termStandBy 不算距离).
+        {
+          uint64_t dist_cnt = appr_alg.getDistComputations();
+          double avg_per_q = query_load ? (double)dist_cnt / query_load : 0.0;
+          printf("[dist_cnt] node=%u ef=%zu total=%llu avg/query=%.1f\n",
+                 (unsigned)appr_alg.rdma_param.machine_id, ef,
+                 (unsigned long long)dist_cnt, avg_per_q);
+
+          // 全局值 (term 协议聚合, 与 baseline MPI_Reduce 口径一致)
+          uint64_t global_dist = appr_alg.getGlobalDistComputations();
+          double global_avg = qsize ? (double)global_dist / qsize : 0.0;
+          printf("[dist_cnt_global] ef=%zu total=%llu avg/query=%.1f\n",
+                 ef, (unsigned long long)global_dist, global_avg);
+        }
       } break;
 
       case B1_ASYNC: {
@@ -354,12 +521,12 @@ static void test_vs_recall(
           appr_alg.printQueryBatchInfo(stopw.getElapsedTimeMicro());
         }
         float recall = 1.0f * correct.load() / total.load();
-        float time_us_per_query = stopw.getElapsedTimeMicro() / query_load;
+        float time_ms_per_query = stopw.getElapsedTimeMicro() / query_load / 1000.0f;
         float qps = 1000000.0 * query_load / stopw.getElapsedTimeMicro();
-        cout << ef << "\t" << recall << "\t" << time_us_per_query << " us\t"
+        cout << ef << "\t" << recall << "\t" << time_ms_per_query << " ms\t"
              << qps << " /s\n";
         if (recall > 1.0) {
-          cout << recall << "\t" << time_us_per_query << " us\n";
+          cout << recall << "\t" << time_ms_per_query << " ms\n";
           break;
         }
       } break;
@@ -376,7 +543,13 @@ static void test_vs_recall(
         RangeIterator all(query_load);
         on_each(all);
 
-        double cumu_lat_us = 0.0;
+        // Per-query latency: record dispatch start per query, accumulate
+        // duration when query finishes.  do_all_standby barrier ensures
+        // all b2k_start[] writes (dispatch phase) complete before any
+        // reads (standby phase).
+        std::vector<std::chrono::high_resolution_clock::time_point> b2k_start(query_load);
+        std::atomic<uint64_t> total_lat_us{0};
+        std::atomic<size_t> lat_cnt(0);
         double avg_lat_us = 0.0;
 
         appr_alg.scala_search_init(query_ptr, vecsize, query_load);
@@ -399,12 +572,19 @@ static void test_vs_recall(
               #endif
               // printf("]]] new q%u\n", new_qid);
 
+              b2k_start[new_qid] = std::chrono::high_resolution_clock::now();
               appr_alg.dispatch_kmeans_query_start(new_qid, k);
 
               std::vector<uint32_t> b2_finished_queue = appr_alg.b2_deal_local(k);
               for(uint32_t q : b2_finished_queue) {
                 // printf("]]] q%u finished\n");
                 // proc end query.
+                auto q_end = std::chrono::high_resolution_clock::now();
+                total_lat_us.fetch_add(
+                    (uint64_t)duration_cast<std::chrono::microseconds>(
+                        q_end - b2k_start[q]).count(),
+                    std::memory_order_relaxed);
+                lat_cnt.fetch_add(1, std::memory_order_relaxed);
                 auto &result = appr_alg.global_query[q]->result;
                 std::priority_queue<std::pair<dist_t, labeltype>> gt(answers[q]);
                 unordered_set<labeltype> g;
@@ -428,6 +608,12 @@ static void test_vs_recall(
                 std::vector<uint32_t> b2_finished_queue = appr_alg.b2_deal_local_standby(k);
                 for(uint32_t q : b2_finished_queue) {
                   // proc end query.
+                  auto q_end = std::chrono::high_resolution_clock::now();
+                  total_lat_us.fetch_add(
+                      (uint64_t)duration_cast<std::chrono::microseconds>(
+                          q_end - b2k_start[q]).count(),
+                      std::memory_order_relaxed);
+                  lat_cnt.fetch_add(1, std::memory_order_relaxed);
                   auto &result = appr_alg.global_query[q]->result;
                   std::priority_queue<std::pair<dist_t, labeltype>> gt(answers[q]);
                   unordered_set<labeltype> g;
@@ -457,13 +643,16 @@ static void test_vs_recall(
             appr_alg.b2_member_deal_local_standby(k);
           });
         }
+        if (lat_cnt.load() > 0) {
+          avg_lat_us = (double)total_lat_us.load() / lat_cnt.load();
+        }
         float recall = 1.0f * correct.load() / total.load();
-        float time_us_per_query = stopw.getElapsedTimeMicro() / query_load;
         float qps = 1000000.0 * query_load / stopw.getElapsedTimeMicro();
-        cout << ef << "\t" << recall << "\t" << avg_lat_us << " us\t"
+        float avg_lat_ms = avg_lat_us / 1000.0;
+        cout << ef << "\t" << recall << "\t" << avg_lat_ms << " ms\t"
              << qps << " /s\n";
         if (recall > 1.0) {
-          cout << recall << "\t" << avg_lat_us << " us\n";
+          cout << recall << "\t" << avg_lat_ms << " ms\n";
           break;
         }
 
@@ -492,10 +681,65 @@ static void test_vs_recall(
         
 #endif
 
-        appr_alg.initTerm();
         RangeIterator all(query_load);
         on_each(all);
-        std::atomic<size_t> load_cnt(0);
+
+        // ── Warmup (runs once, on first ef iteration) ──────────
+        // Heats page tables, TLB, CPU cache, RDMA qp paths before
+        // timed measurement.  Uses warmup_ef (or max ef from list).
+        if (!warmup_done && anns_param.warmup_runs > 0) {
+          size_t w_ef = anns_param.warmup_ef > 0
+                            ? anns_param.warmup_ef
+                            : efs.back();
+          size_t saved_ef = ef;
+          appr_alg.set_ef(w_ef);
+          if (appr_alg.rdma_param.machine_id == 0)
+            printf("Warmup: %d pass(es) at ef=%zu ...\n",
+                   anns_param.warmup_runs, w_ef);
+          for (int w = 0; w < anns_param.warmup_runs; ++w) {
+            appr_alg.initTerm();
+            std::atomic<size_t> w_load_cnt(0);
+            appr_alg.scala_search_init(query_ptr, vecsize, qsize);
+            do_all_standby(
+                iterate(all),
+                [&](const uint32 &i) {
+                  auto wres = appr_alg.scala_search_sub(load_start + i);
+                  for (auto &rr : wres) { (void)rr; w_load_cnt.fetch_add(1); }
+                },
+                [&]() {
+                  int tid = ThreadPool::getTID();
+                  while (w_load_cnt.load() < query_load) {
+                    auto wres = appr_alg.scala_search_sub_wait_finish();
+                    for (auto &rr : wres) { (void)rr; w_load_cnt.fetch_add(1); }
+                  }
+                  if (tid == 0)
+                    appr_alg.sendTerm(0, 0, query_load, 0.0);
+                  appr_alg.scala_search_sub_standby(qsize);
+                },
+                steal(), loopname("Warmup"));
+          }
+          appr_alg.set_ef(saved_ef);
+          warmup_done = true;
+          if (appr_alg.rdma_param.machine_id == 0)
+            printf("Warmup done.\n");
+        }
+
+        // ── Repeated measurement runs ──────────────────────────
+        // Run num_runs times, record wall-time each run, report
+        // median QPS.  Stage timing printed only on the last run.
+        std::vector<double> run_times;
+        int num_runs = anns_param.num_runs > 0 ? anns_param.num_runs : 1;
+
+        for (int r = 0; r < num_runs; ++r) {
+          correct.store(0, std::memory_order_relaxed);
+          total.store(0, std::memory_order_relaxed);
+
+          appr_alg.initTerm();
+          std::atomic<size_t> load_cnt(0);
+          // Stage timing accumulators (atomic, accessed from multiple threads)
+          std::atomic<uint64_t> sum_pre_us(0), sum_post_us(0), sum_term_us(0);
+          std::atomic<size_t> stage_cnt(0);
+          std::atomic<uint64_t> sum_dispatch_us(0), sum_yield_us(0), sum_comp_l_us(0), sum_comp_r_us(0);
 #ifdef LAT
         // for latency record
         std::chrono::high_resolution_clock::time_point start[qsize];
@@ -573,7 +817,22 @@ static void test_vs_recall(
             res->profiler.report();
 #endif
 #endif
-            delete res;
+            // Accumulate stage timing (before delete)
+            sum_pre_us.fetch_add(res->pre_stage_us, std::memory_order_relaxed);
+            sum_post_us.fetch_add(res->post_stage_us, std::memory_order_relaxed);
+            sum_term_us.fetch_add(res->term_us, std::memory_order_relaxed);
+            stage_cnt.fetch_add(1, std::memory_order_relaxed);
+            // Accumulate POST_STAGE sub-timing
+            sum_dispatch_us.fetch_add(res->post_dispatch_us, std::memory_order_relaxed);
+            sum_yield_us.fetch_add(res->post_yield_us, std::memory_order_relaxed);
+            sum_comp_l_us.fetch_add(res->post_compute_l_us, std::memory_order_relaxed);
+            sum_comp_r_us.fetch_add(res->post_compute_r_us, std::memory_order_relaxed);
+            // NOTE: do NOT delete res here.  global_query[res->query_id]
+            // would become a dangling pointer while other threads may
+            // still be processing late RDMA results for this query.
+            // Queries are freed in scala_search_init at the start of
+            // the next ef iteration (a safe point where all threads are
+            // idle and termination/standby has completed).
             load_cnt.fetch_add(1);
             // printf("load_cnt ++: %u\n", load_cnt.load());
           }
@@ -590,6 +849,13 @@ static void test_vs_recall(
           m_profiler.start("g_actual");
         });
 #endif
+        bool is_last_run = (r == num_runs - 1);
+
+        // 距离计算次数: 只在最后一轮清零, 使 read 出来的值 = 最后一轮单轮累计
+        // (与 baseline hnsw_shard_l2.cpp 口径一致: 单轮值, 非 num_runs 累加)
+        if (is_last_run) {
+          appr_alg.resetDistComputations();
+        }
 
         do_all_standby(
             iterate(all),
@@ -627,6 +893,11 @@ static void test_vs_recall(
 #endif
               if (tid == 0) {
                 double cumu_lat_us = 0.0;
+#ifdef LAT
+                for (uint32_t q = load_start; q < load_start + query_load; q++) {
+                  cumu_lat_us += duration_cast<std::chrono::microseconds>(end[q] - start[q]).count();
+                }
+#endif
                 appr_alg.sendTerm(correct.load(), total.load(), query_load, cumu_lat_us);
               }
 #ifdef DEBUG
@@ -640,62 +911,191 @@ static void test_vs_recall(
 #ifdef COMM_PROFILE
                 appr_alg.report_comm_info(exec_time);
 #endif
-                if (appr_alg.rdma_param.machine_id == 0) {
-                  if (anns_param.evaluation_save_path.empty()) {
-                    appr_alg.printQueryBatchInfo(exec_time);
-                  } else {
-                    appr_alg.printQueryBatchInfoSave(
-                        exec_time, appr_alg.get_evaluation_save_file());
-                  }
+                // Stage timing breakdown control:
+                //   COTRA_STAGE_TIMING=0 | unset -> 不打印
+                //   COTRA_STAGE_TIMING=1        -> 打印简洁版 (POST_PRE_TERM 合计，无POST子项)
+                //   COTRA_STAGE_TIMING=2        -> 打印完整版 (含DISPATCH/YIELD/COMPUTE_L/COMPUTE_R)
+                static int stage_timing_mode = -1;
+                if (stage_timing_mode < 0) {
+                  const char *env = std::getenv("COTRA_STAGE_TIMING");
+                  stage_timing_mode = (env && *env) ? std::atoi(env) : 2; // 默认=2(完整)，保持之前行为
                 }
+                if (is_last_run && stage_cnt.load() > 0 && stage_timing_mode >= 1) {
+                  double avg_pre = (double)sum_pre_us.load() / stage_cnt.load();
+                  double avg_post = (double)sum_post_us.load() / stage_cnt.load();
+                  double avg_term = (double)sum_term_us.load() / stage_cnt.load();
+                  double avg_total = avg_pre + avg_post + avg_term;
+                  printf("-------------- Stage Timing (avg per query, cnt=%zu, run %d/%d) --------------\n", stage_cnt.load(), r + 1, num_runs);
+                  printf("  PRE_STAGE  (routing+dispatch): %.2f us  (%.1f%%)\n", avg_pre, avg_pre * 100.0 / avg_total);
+                  printf("  POST_STAGE (main search)     : %.2f us  (%.1f%%)\n", avg_post, avg_post * 100.0 / avg_total);
+                  if (stage_timing_mode >= 2) {
+                    double avg_disp = (double)sum_dispatch_us.load() / stage_cnt.load();
+                    double avg_yield = (double)sum_yield_us.load() / stage_cnt.load();
+                    double avg_cl = (double)sum_comp_l_us.load() / stage_cnt.load();
+                    double avg_cr = (double)sum_comp_r_us.load() / stage_cnt.load();
+                    double post_sum = avg_disp + avg_yield + avg_cl + avg_cr;
+                    if (post_sum > 0) {
+                      printf("    DISPATCH    (post RDMA)    : %.2f us  (%.1f%% of POST)\n", avg_disp, avg_disp * 100.0 / post_sum);
+                      printf("    YIELD_WAIT  (wait remote)  : %.2f us  (%.1f%% of POST)\n", avg_yield, avg_yield * 100.0 / post_sum);
+                      printf("    COMPUTE_L   (local dist)   : %.2f us  (%.1f%% of POST)\n", avg_cl, avg_cl * 100.0 / post_sum);
+                      printf("    COMPUTE_R   (remote res)   : %.2f us  (%.1f%% of POST)\n", avg_cr, avg_cr * 100.0 / post_sum);
+                    }
+                  }
+                  printf("  TERMINATION(token passing)   : %.2f us  (%.1f%%)\n", avg_term, avg_term * 100.0 / avg_total);
+                  printf("  TOTAL                        : %.2f us\n", avg_total);
+                  printf("------------------------  End  ------------------------\n");
+                }
+                // printQueryBatchInfo moved to after the repeat loop
+                // (uses median_time across all runs instead of single-run exec_time)
               }
             },
             steal(), loopname("Reset"));
 
-#ifdef LAT
-      double all_lat = 0.0;
-      for(uint32_t q = load_start; q < load_start + query_load; q++){
-        all_lat += duration_cast<std::chrono::microseconds>(end[q] - start[q]).count();
-      }
-      std::cout << "Avg lat: " << all_lat / query_load << "us\n";
-#endif
+          run_times.push_back(exec_time);
 
+#ifdef LAT
+          if (is_last_run) {
+            double all_lat = 0.0;
+            for(uint32_t q = load_start; q < load_start + query_load; q++){
+              all_lat += duration_cast<std::chrono::microseconds>(end[q] - start[q]).count();
+            }
+            {
+              static int lat_mode = -1;
+              if (lat_mode < 0) {
+                const char *env = std::getenv("COTRA_AVG_LAT");
+                lat_mode = (env && *env) ? std::atoi(env) : 1;
+              }
+              if (lat_mode) {
+                std::cout << "Avg lat: " << all_lat / query_load / 1000.0 << "ms\n";
+              }
+            }
+          }
+#endif
 
 #ifdef PROFILER
-        on_each([&](uint64 tid, uint64 total) {
-          Profiler &m_profiler = *appr_alg.all_profiler.getLocal();
-          m_profiler.end("g_actual");
-        });
+          on_each([&](uint64 tid, uint64 total) {
+            Profiler &m_profiler = *appr_alg.all_profiler.getLocal();
+            m_profiler.end("g_actual");
+          });
+          if (is_last_run) {
+#ifdef DEBUG
+            if (appr_alg.rdma_param.machine_id != 0) {
+              for (uint32_t q = 0; q < 32; q++) {
+                printf("q %u report:\n", q);
+                appr_alg.global_query[q]->profiler.get_mhz();
+                appr_alg.global_query[q]->profiler.report();
+              }
+            }
 #endif
-        if(appr_alg.rdma_param.machine_id != 0) {
+            Profiler over_all_pro;
+            over_all_pro.get_mhz();
+
+            for (uint32_t t = 0; t < getActiveThreads(); ++t) {
+              auto *local_prof = appr_alg.all_profiler.getRemote(t);
+              Profiler &local_profiler = *local_prof;
+              over_all_pro += local_profiler;
+            }
+            over_all_pro.report_sum();
+          }
+#endif
+        }  // end for (r = 0 .. num_runs)
+
+        // ── 距离计算次数 / 评估的邻居数 (ndis) ── [cotra / ScalaANN_v3]
+        // HNSW 中每次 fstdistfunc_ 调用 = 对一个邻居算一次距离, 故
+        // "距离计算次数" == "评估的邻居数", 是同一个数.
+        // cotra(ScalaANN_v3): query_load = qsize / MACHINE_NUM, 每个节点
+        //   只发起 qsize/8 个 query, 但会参与其他节点 query 的搜索 (core/
+        //   non-core). 故本机 dist_cnt 包含了远多于 qsize/8 个 query 的距离.
+        //   本机 avg/query = dist_cnt / (qsize/8)  (不代表单 query 全局值!)
+        //   全局 avg/query = Σ各节点 dist_cnt / qsize  (qsize = 总 query 数)
+        // 口径与 baseline hnsw_shard_l2.cpp 一致: 单轮(最后一轮)累计值.
+        //   baseline 全局值 = Σ 8 node ndis (经 MPI_Reduce)
+        //   cotra  全局值 = Σ 8 node dist_cnt (经第二次 term 交换, 见下方)
+        {
+          uint64_t dist_cnt = appr_alg.getDistComputations();
+          double avg_per_q = query_load ? (double)dist_cnt / query_load : 0.0;
+          printf("[dist_cnt] node=%u ef=%zu runs=%d total=%llu avg/query=%.1f\n",
+                 (unsigned)appr_alg.rdma_param.machine_id, ef, num_runs,
+                 (unsigned long long)dist_cnt, avg_per_q);
+        }
+
+        // ── Median QPS output (after all runs) ─────────────────
+        // recall / avg_lat come from the last run's rdma_comm state
+        // (deterministic for same ef + queries + graph).  QPS uses
+        // the median wall-time across all runs for jitter resistance.
+        //
+        // IMPORTANT: run_times below is SORTED before printing, so the
+        // "run_times(ms)" line shows the SPREAD (min..max), NOT the
+        // order runs actually happened.  To tell run-to-run TRENDS
+        // (accumulation/leak) from random STRAGGLER spikes, we keep a
+        // chronological copy here and print it as chrono_run_times.
+        std::vector<double> chrono_times = run_times;
+        std::sort(run_times.begin(), run_times.end());
+        double median_time = run_times[run_times.size() / 2];
+        double min_time = run_times.front();
+        double max_time = run_times.back();
+
+        if (appr_alg.rdma_param.machine_id == 0) {
+          if (anns_param.evaluation_save_path.empty()) {
+            appr_alg.printQueryBatchInfo(median_time);
+          } else {
+            appr_alg.printQueryBatchInfoSave(
+                median_time, appr_alg.get_evaluation_save_file());
+          }
+          float tot_qload = appr_alg.rdma_comm.query_load;
+          float med_qps = 1000000.0f * tot_qload / median_time;
+          float min_qps = 1000000.0f * tot_qload / max_time;
+          float max_qps = 1000000.0f * tot_qload / min_time;
+          printf("[runs=%d] median_qps=%.3f  min_qps=%.3f  max_qps=%.3f\n",
+                 num_runs, med_qps, min_qps, max_qps);
+          printf("  run_times(ms):");
+          for (double t : run_times) printf(" %.1f", t / 1000.0);
+          printf("\n");
+          // Chronological order (run 1 .. run N) for variance diagnosis.
+          // If these climb monotonically -> accumulation/leak (real bug).
+          // If they jump randomly -> straggler amplification by the
+          // global barrier (exec_query.h:731), intrinsic to the design.
+          printf("  chrono_run_times(ms):");
+          for (double t : chrono_times) printf(" %.1f", t / 1000.0);
+          printf("\n");
+        }
+
+        // Member machine output (using median_time).
+        if (appr_alg.rdma_param.machine_id != 0) {
           float recall = 1.0f * correct.load() / total.load();
-          float time_us_per_query = exec_time / query_load;
-          float qps = 1000000.0 * query_load / exec_time;
-          cout << ef << "\t" << recall << "\t" << time_us_per_query << " us\t"
+          float time_ms_per_query = median_time / query_load / 1000.0f;
+          float qps = 1000000.0 * query_load / median_time;
+          static bool header_printed = false;
+          if (!header_printed) {
+            cout << "ef" << "\t" << "recall" << "\t" << "time_per_query(ms)" << "\t" << "qps" << "\n";
+            header_printed = true;
+          }
+          cout << ef << "\t" << recall << "\t" << time_ms_per_query << " ms\t"
               << qps << " /s\n";
         }
-#ifdef PROFILER
-#ifdef DEBUG
-        if (appr_alg.rdma_param.machine_id != 0) {
-          for (uint32_t q = 0; q < 32; q++) {
-            printf("q %u report:\n", q);
-            appr_alg.global_query[q]->profiler.get_mhz();
-            appr_alg.global_query[q]->profiler.report();
-          }
-        }
-#endif
-        Profiler over_all_pro;
-        over_all_pro.get_mhz();
 
-        for (uint32_t t = 0; t < getActiveThreads(); ++t) {
-          auto *local_prof = appr_alg.all_profiler.getRemote(t);
-          Profiler &local_profiler = *local_prof;
-          // printf("Profiler report of thread %lu\n", t);
-          // local_profiler.report_sum();
-          over_all_pro += local_profiler;
+        // ── 全局距离计算次数 (第二次 term 交换) ── [cotra / ScalaANN_v3]
+        // cotra 的 sendTerm 在 scala_search_sub_standby 之前调用, 故第一次
+        // term 交换的 all_computation_cnt 不含 standby 阶段距离.
+        // 此处在所有 QPS/recall 输出完成后, 做第二次 term 交换:
+        //   1. initTerm()  — 重置 term 标志 + all_computation_cnt
+        //   2. sendTerm()  — 各节点发送最终 dist_cnt (含 standby, 精确)
+        //   3. check_term() 轮询直到全部 8 节点 term 到齐
+        //   4. all_computation_cnt = Σ 8 节点 dist_cnt = 全局精确值
+        // 注意: initTerm 会重置 rdma_comm.correct/total/query_load, 故必须
+        //       在 QPS 输出 (用 rdma_comm.query_load) 之后执行.
+        {
+          appr_alg.initTerm();
+          appr_alg.sendTerm(0, 0, 0, 0.0);
+          while (!appr_alg.check_term()) {
+            // busy-wait: check_term 内部调 poll_send/poll_recv 推进 RDMA
+          }
+          uint64_t global_dist = appr_alg.getGlobalDistComputations();
+          double global_avg = qsize ? (double)global_dist / qsize : 0.0;
+          printf("[dist_cnt_global] ef=%zu total=%llu avg/query=%.1f\n",
+                 ef, (unsigned long long)global_dist, global_avg);
         }
-        over_all_pro.report_sum();
-#endif
+
 #ifdef PROF_DEGREE
         printf(
             "local cnt: %llu deg: %llu\n", appr_alg.local_cnt,

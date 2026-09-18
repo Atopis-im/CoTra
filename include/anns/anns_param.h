@@ -189,6 +189,22 @@ class AnnsParameter {
   size_t vecnum; // all vector number (overall machines)
   uint32_t gt_knn;      // Ground truth KNN number.
   uint32_t res_knn;     // Actually exec knn, Set recall@k = 1,10,100
+
+  // Search ef list to sweep.  Populated from --search-ef-list CLI arg
+  // (comma-separated, e.g. "50,100,200").  When empty, a hard-coded
+  // default list is used (see exec_query.h), preserving old behaviour.
+  std::vector<size_t> search_ef_list;
+
+  // ── Measurement control: warmup + repeated runs ──────────────
+  // warmup_runs:  untimed warmup passes before measurement (0 = skip).
+  //               Heats page tables, TLB, CPU cache, RDMA qp paths.
+  //               Default 1.
+  // warmup_ef:    ef for warmup passes (0 = use max ef from list).
+  // num_runs:     timed repetitions per ef point; QPS reported as median.
+  //               Default 10.  Set 1 to reproduce old single-shot behaviour.
+  int warmup_runs{1};
+  size_t warmup_ef{0};
+  int num_runs{10};
   L2Space *l2_space;
   L2SpaceI *l2_space_i;
   L2SpaceII *l2_space_ii;

@@ -62,6 +62,19 @@ class LockFreeQueue {
     return value;
   }
 
+  // Drain all elements.  Only call when no other thread is concurrently
+  // pushing/popping this queue (i.e. at a safe point between runs where all
+  // worker threads are idle).  Used by BalanceQueue::clearAll() during
+  // scala_search_init to prevent stale tasks from a previous ef iteration
+  // accumulating across runs — that accumulation was the root cause of the
+  // "runs get progressively slower" pattern (CV ~38%) observed at 72 threads.
+  void clear() {
+    lock_.lock();
+    std::queue<T> empty;
+    queue_.swap(empty);
+    lock_.unlock();
+  }
+
   size_t size() const {
     lock_.lock();
     size_t size = queue_.size();

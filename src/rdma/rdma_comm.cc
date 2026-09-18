@@ -6,7 +6,9 @@
 #include <chrono>
 #include <exception>
 #include <fstream>
+#include <mutex>
 
+#include "coromem/include/threadpool.h"
 #include "rdma/ip_config.h"
 
 namespace {
@@ -766,6 +768,17 @@ int RdmaCommunication::poll_recv() {
     fprintf(stderr, "Fatal: failed to poll the RDMA receive completion queue\n");
     abort();
   }
+
+  // // [DEBUG] Periodic log when CQ is empty
+  // {
+  //   static thread_local uint64_t _dbg_poll_cnt = 0;
+  //   _dbg_poll_cnt++;
+  //   if (_dbg_poll_cnt % 1000000 == 0) {
+  //     printf("[DBG-POLL][T%u] recv_cq ne=%d total_polls=%lu\n",
+  //            ThreadPool::getTID(), ne, _dbg_poll_cnt);
+  //   }
+  // }
+
   if (ne > 0) {
     // printf("ne: %d\n", ne);
     for (int i = 0; i < ne; i++) {
@@ -788,28 +801,60 @@ int RdmaCommunication::poll_recv() {
         auto *sbuf = send_write_buf.getLocal();
 
         uint32_t m_id = wr_id >> 16;
-        uint32_t true_wr_id = wr_id & LOW_16BIT_MASK;
+        uint32_t true_wr_id = wr_id & LOW_16BIT_MASK;  // recv WR index (for repost)
         uint32_t data_size = wc.byte_len;
         uint32_t imm = ntohl(wc.imm_data);
         ControlType control = ControlType(imm >> 16);
-        uint32_t buf_id = imm & LOW_16BIT_MASK;
+        uint32_t buf_id = imm & LOW_16BIT_MASK;  // sender's send buf index
+
+        // Validate recv WR index (needed for reposting below).
+        if (true_wr_id >= MAX_WRITE_NUM) {
+          fprintf(stderr,
+          "WARN [poll_recv]: true_wr_id %u >= MAX_WRITE_NUM %d (m%u control %d), skipping\n",
+          true_wr_id, MAX_WRITE_NUM, m_id, control);
+          post_write_recv(m_id, true_wr_id);
+          continue;
+        }
+        // In RDMA write-with-imm, sender writes to
+        // remote_addr + MAX_QUERYBUFFER_SIZE * buf_id, so data lands at
+        // rbuf->buffer[m_id][buf_id].  The recv WR index (true_wr_id) is
+        // just a "slot" for the imm_data completion and has NO relation to
+        // where the data was written.  Using true_wr_id to read the buffer
+        // was a bug: with 2 nodes the free list stays ordered so
+        // true_wr_id == buf_id by coincidence, but with 8 nodes the
+        // recycled free list diverges and we read stale/wrong buffers.
+        if (buf_id >= MAX_WRITE_NUM) {
+          fprintf(stderr,
+          "WARN [poll_recv]: buf_id %u >= MAX_WRITE_NUM %d (m%u control %d true_wr_id %u), skipping\n",
+          buf_id, MAX_WRITE_NUM, m_id, control, true_wr_id);
+          post_write_recv(m_id, true_wr_id);
+          continue;
+        }
         char *ptr = (char *)rbuf->buffer[m_id][buf_id];
 
-        // printf(
-        //     "recv write imm, bufid %d control %d size %d\n", buf_id, control,
-        //     data_size);
-        
         // TODO: use switch
         if (control == RELEASE || control == CLEAR) {
           // proc the released send buffer id.
-          int *release_ptr = (int *)ptr;
-          int num = release_ptr[0];
-          // printf("==> get release id ");
-          for (int i = 1; i < num + 1; i++) {
-            sbuf->buff_id_list[m_id]->push_back(release_ptr[i]);
-            // printf("%d ", release_ptr[i]);
+          uint32_t *release_ptr = (uint32_t *)ptr;
+          uint32_t num = release_ptr[0];
+          if (num > MAX_WRITE_NUM) {
+            // Non-fatal: skip this corrupt RELEASE message.
+            fprintf(stderr,
+            "WARN [poll_recv]: RELEASE num %u > MAX_WRITE_NUM %d from m%u (buf_id %u true_wr_id %u), skipping message\n",
+            num, MAX_WRITE_NUM, m_id, buf_id, true_wr_id);
+            num = 0;
           }
-          // printf("\n");
+          for (uint32_t i = 1; i <= num; i++) {
+            uint32_t release_id = release_ptr[i];
+            if (release_id >= MAX_WRITE_NUM) {
+              // Non-fatal: skip this garbage entry.
+              fprintf(stderr,
+              "WARN [poll_recv]: RELEASE buf_id %u >= MAX_WRITE_NUM %d from m%u (entry %u/%u), skipping entry\n",
+              release_id, MAX_WRITE_NUM, m_id, i, num);
+              continue;
+            }
+            sbuf->buff_id_list[m_id]->push_back(release_id);
+          }
         } else if (control == B2_START) {
           char *b2_info = (char *)malloc(data_size);
           memcpy(b2_info, ptr, data_size);
@@ -893,7 +938,6 @@ int RdmaCommunication::poll_recv() {
           rbuf->recv_compute.push_back(new_cmp);
           // printf("recved compute\n");
         } else if (control == TERMINATION) {
-          term[m_id] = true;
           // printf("recv m%u term, all term state:\n", m_id);
           // for (uint32_t m = 0; m < MACHINE_NUM; m++) printf("%d ",
           // term[m]); printf("\n");
@@ -903,26 +947,45 @@ int RdmaCommunication::poll_recv() {
           memcpy(
               &q_correct, static_cast<char *>(ptr) + offset, sizeof(q_correct));
           offset += sizeof(q_correct);
-          correct += q_correct;
           memcpy(&q_total, static_cast<char *>(ptr) + offset, sizeof(q_total));
           offset += sizeof(q_total);
-          total += q_total;
           memcpy(
               &q_query_load, static_cast<char *>(ptr) + offset,
               sizeof(q_query_load));
           offset += sizeof(q_query_load);
-          query_load += q_query_load;
 
           memcpy(
             &cumu_lat_us, static_cast<char *>(ptr) + offset, sizeof(cumu_lat_us));
           offset += sizeof(cumu_lat_us);
-          query_lat_sum += cumu_lat_us;
 
           size_t recv_computation_cnt;
           memcpy(
             &recv_computation_cnt, static_cast<char *>(ptr) + offset, sizeof(size_t));
           offset += sizeof(recv_computation_cnt);
-          all_computation_cnt += recv_computation_cnt;
+
+          // Epoch: 本条 term 所属轮次 (见 rdma_comm.h)
+          uint64_t msg_round;
+          memcpy(
+            &msg_round, static_cast<char *>(ptr) + offset, sizeof(uint64_t));
+          offset += sizeof(uint64_t);
+
+          uint64_t cur_round = term_round.load(std::memory_order_relaxed);
+          if (msg_round == cur_round) {
+            term[m_id] = true;
+            correct += q_correct;
+            total += q_total;
+            query_load += q_query_load;
+            query_lat_sum += cumu_lat_us;
+            all_computation_cnt += recv_computation_cnt;
+          } else if (msg_round > cur_round) {
+            // 未来轮的 term 提前到达: 暂存, 等进入该轮后再应用
+            std::lock_guard<std::mutex> lk(future_term_mtx);
+            future_terms.push_back(FutureTerm{msg_round, (int)m_id,
+              q_correct, q_total, q_query_load, cumu_lat_us,
+              recv_computation_cnt});
+          } else {
+            // 陈旧 term (属于已完成的轮次): 丢弃
+          }
         } else {
           printf("Error: Unexpected buff contorl flag %d.\n", control);
         }
@@ -939,6 +1002,12 @@ int RdmaCommunication::poll_recv() {
 }
 
 void RdmaCommunication::send_write_release(int machine_id, uint32_t buf_id) {
+  if (buf_id >= MAX_WRITE_NUM) {
+    fprintf(stderr,
+    "WARN [send_write_release]: buf_id %u >= MAX_WRITE_NUM %d from m%u, skipping\n",
+    buf_id, MAX_WRITE_NUM, machine_id);
+    return;
+  }
   auto *rbuf = recv_write_buf.getLocal();
   rbuf->release_id_list[machine_id]->push_back(buf_id);
   // printf(
@@ -1007,7 +1076,7 @@ char *RdmaCommunication::sync_read(
       BufferCache(machine_id, internal_id, internal_id, -1, NULL)};
   post_read(vecs, size);
   poll_read();
-  release_cache(vecs[0].buffer_id);
+  release_cache(vecs[0].buffer_id, vecs[0].owner_thread);
   return vecs[0].buffer_ptr;
 }
 
@@ -1021,6 +1090,7 @@ int RdmaCommunication::post_read(
     std::vector<BufferCache> &vectors, size_t vec_size, uint32_t query_id) {
   auto *ctx = rdma_ctx.getLocal();
   auto *buf = read_buf.getLocal();
+  const uint32_t owner_thread = ThreadPool::getTID();
 
   // ctx->run_post_read(vectors, vec_size);
   // TODO: change to buffer queue.
@@ -1031,10 +1101,28 @@ int RdmaCommunication::post_read(
   for (BufferCache &vec : vectors) {
     uint32_t m = vec.machine_id;
     size_t offset = vec.internal_id * vec_size;
-    assert(buf->buff_id_list.size() > 0);
-    vec.buffer_id = buf->buff_id_list.front();
-    buf->buff_id_list.pop_front();
+    // The free-list is shared with other threads that return consumed buffers
+    // via release_cache(buffer_id, owner_thread) (see below).  Guard the
+    // front/pop with buff_id_mtx to avoid a concurrent push_back corrupting
+    // the deque.  The original `assert(size()>0)` is compiled out under
+    // Release/-DNDEBUG, so an empty pool used to pop_front on an empty deque
+    // -> segfault (139).  Replace it with a real check that aborts loudly so a
+    // genuine pool exhaustion is diagnosable instead of a mystery crash.
+    {
+      std::lock_guard<std::mutex> lk(buf->buff_id_mtx);
+      if (buf->buff_id_list.empty()) {
+        fprintf(stderr,
+            "FATAL [post_read]: read buffer pool exhausted for tid %u "
+            "(owner_thread %u): no free buffer id available (MAX_CACHE_VEC=%d, "
+            "outstanding reads not yet polled/released). Aborting.\n",
+            ThreadPool::getTID(), owner_thread, MAX_CACHE_VEC);
+        abort();
+      }
+      vec.buffer_id = buf->buff_id_list.front();
+      buf->buff_id_list.pop_front();
+    }
     vec.buffer_ptr = (char *)ctx->read_to_ptr[vec.buffer_id];
+    vec.owner_thread = owner_thread;
     buf->bufcache_ptr[vec.buffer_id] = vec;
     // printf("postread buf_id %u vid %u\n", vec.buffer_id, vec.vector_id);
     size_t &r = ctx->wr_cnt[m];
@@ -1083,13 +1171,17 @@ int RdmaCommunication::poll_read() {
   return 0;
 }
 
-void RdmaCommunication::release_cache(int buffer_id) {
-  // printf("release cache %d\n", buffer_id);
-  auto *buf = read_buf.getLocal();
-  buf->buff_id_list.push_back(buffer_id);
-  // printf(
-  //     "release cache %d buflist sz %u\n", buffer_id,
-  //     buf->buff_id_list.size());
+void RdmaCommunication::release_cache(int buffer_id, uint32_t owner_thread) {
+  auto *buf = read_buf.getRemote(owner_thread);
+  // This is the cross-thread return path: the caller is frequently a different
+  // thread than owner_thread (e.g. a worker that drained recv_async_read_queue
+  // for a query whose reads were posted by another thread).  The owning thread
+  // concurrently pops buff_id_list in post_read(), so an unguarded push_back
+  // here races with that pop.  Guard with buff_id_mtx.
+  {
+    std::lock_guard<std::mutex> lk(buf->buff_id_mtx);
+    buf->buff_id_list.push_back(buffer_id);
+  }
   return;
 }
 
@@ -1131,28 +1223,63 @@ int RdmaCommunication::get_write_send_buf(
     do {
       poll_send();
       poll_recv();  // Recv released buffer indicate by control.
+      // Flush pending release IDs immediately to prevent deadlock when
+      // both nodes are spinning with send buffers exhausted.
+      auto *rbuf = recv_write_buf.getLocal();
+      if (rbuf->release_id_list[machine_id]->size() > 0 &&
+      sbuf->buff_id_list[machine_id]->size() > 0) {
+      uint32_t num = 0;
+      uint32_t send_buf_id = sbuf->buff_id_list[machine_id]->front();
+      sbuf->buff_id_list[machine_id]->pop_front();
+      uint32_t *ptr = (uint32_t *)sbuf->buffer[machine_id][send_buf_id];
+      while (rbuf->release_id_list[machine_id]->size() > 0) {
+        uint32_t release_id = rbuf->release_id_list[machine_id]->front();
+        rbuf->release_id_list[machine_id]->pop_front();
+        if (release_id >= MAX_WRITE_NUM) {
+          fprintf(stderr,
+          "WARN [get_write_send_buf]: release_id %u >= MAX_WRITE_NUM %d, skipping\n",
+          release_id, MAX_WRITE_NUM);
+          continue;
+        }
+        ptr[num + 1] = release_id;
+        num++;
+      }
+      ptr[0] = num;
+      post_write_send(machine_id, send_buf_id, (num + 1) * 4, RELEASE);
+      }
       // reserve buffer for release write send
     } while (sbuf->buff_id_list[machine_id]->size() <= RELEASE_BLOCK);
   } else {
+    // send_release=true path: under high load (8+ nodes) the free list
+    // can be temporarily empty.  Poll for completions and incoming RELEASE
+    // messages to recover buffers instead of crashing.
+    int retry = 0;
+    while (sbuf->buff_id_list[machine_id]->size() == 0 && retry < 1000) {
+      poll_send();
+      poll_recv();
+      retry++;
+    }
     if (sbuf->buff_id_list[machine_id]->size() == 0) {
-      printf("Error: expect sbuf always avaliable.\n");
-      exit(0);
+      fprintf(stderr,
+      "FATAL [get_write_send_buf]: send buf exhausted for m%d after %d retries, aborting\n",
+      machine_id, retry);
+      abort();
     }
   }
   uint32_t buf_id = sbuf->buff_id_list[machine_id]->front();
+  if (buf_id >= MAX_WRITE_NUM) {
+    fprintf(stderr,
+    "FATAL [get_write_send_buf]: buf_id %u >= MAX_WRITE_NUM %d for m%d, aborting\n",
+    buf_id, MAX_WRITE_NUM, machine_id);
+    abort();
+  }
   if (pop) {  // If not in clear state.
     sbuf->buff_id_list[machine_id]->pop_front();
-    // printf(
-    //     "sbuf pop ==> %d left size %d\n", buf_id,
-    //     sbuf->buff_id_list[machine_id]->size());
   } else {
     // move form front to back
     sbuf->buff_id_list[machine_id]->pop_front();
     sbuf->buff_id_list[machine_id]->push_back(buf_id);
   }
-  // printf(
-  //     "get %d. left size %d\n", buf_id,
-  //     sbuf->buff_id_list[machine_id]->size());
   return buf_id;
 }
 
@@ -1160,16 +1287,21 @@ int RdmaCommunication::post_write_send(
     int machine_id, uint32_t buf_id, uint32_t size, ControlType control) {
   auto *ctx = rdma_ctx.getLocal();
 
+  if (buf_id >= MAX_WRITE_NUM) {
+    fprintf(stderr,
+    "FATAL [post_write_send]: buf_id %u >= MAX_WRITE_NUM %d (m%d control %d size %u), aborting\n",
+    buf_id, MAX_WRITE_NUM, machine_id, control, size);
+    abort();
+  }
   size_t offset = MAX_QUERYBUFFER_SIZE * buf_id;
-// printf(
-//     "[post send write] m %d, buf %d, size %d, control %d\n", machine_id,
-//     buf_id, size, control);
 #ifdef COMM_PROFILE
   ctx->write_size += size;
   ctx->write_cnt++;
 #endif
   if (size > MAX_QUERYBUFFER_SIZE) {
-    printf("Error: Exceed the max write buffer size.\n");
+    fprintf(stderr,
+      "FATAL [post_write_send]: size %u > MAX_QUERYBUFFER_SIZE %u (m%d buf %u control %d), aborting\n",
+      size, MAX_QUERYBUFFER_SIZE, machine_id, buf_id, control);
     abort();
   }
   if (ctx->run_post_write_send(
@@ -1262,6 +1394,10 @@ void RdmaCommunication::send_term(
       correct += q_correct;
       total += q_total;
       query_load += q_query_load;
+      query_lat_sum += cumu_lat_us;
+      // FIX: 之前 self 分支漏了 all_computation_cnt, 导致全局聚合
+      // 少了本机自己的 dist_cnt (只有 7 个 remote 节点被累加).
+      all_computation_cnt += computation_cnt;
       continue;
     }
     uint32_t buf_id = get_write_send_buf(m);
@@ -1282,6 +1418,12 @@ void RdmaCommunication::send_term(
       static_cast<char *>(ptr) + offset, &computation_cnt, sizeof(computation_cnt));
     offset += sizeof(computation_cnt);
 
+    // Epoch: 标识本条 term 属于哪一轮, 防止被其他轮次误消费 (见 rdma_comm.h)
+    uint64_t msg_round = term_round.load(std::memory_order_relaxed);
+    memcpy(
+        static_cast<char *>(ptr) + offset, &msg_round, sizeof(msg_round));
+    offset += sizeof(msg_round);
+
     // printf("q%d >> m[%d] buf%d\n", query->query_id, machine_id, buff_id);
     post_write_send(m, buf_id, offset, TERMINATION);
   }
@@ -1297,12 +1439,29 @@ bool RdmaCommunication::check_term() {
 }
 
 void RdmaCommunication::reset_term() {
+  // 进入新一轮 term epoch (worker 线程此时已 quiesce, 单线程调用)
+  uint64_t new_round = term_round.fetch_add(1, std::memory_order_relaxed) + 1;
   for (int m = 0; m < MACHINE_NUM; m++) {
     term[m] = false;
   }
   correct = total = query_load = 0;
   query_lat_sum = 0.0;
   all_computation_cnt = 0;
+  // 应用提前到达的本轮 term (上一轮期间被暂存的)
+  std::lock_guard<std::mutex> lk(future_term_mtx);
+  for (auto it = future_terms.begin(); it != future_terms.end();) {
+    if (it->round == new_round) {
+      term[it->machine_id] = true;
+      correct += it->correct;
+      total += it->total;
+      query_load += it->query_load;
+      query_lat_sum += it->cumu_lat_us;
+      all_computation_cnt += it->computation_cnt;
+      it = future_terms.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 void RdmaCommunication::reset_sendrecv() {
@@ -1438,12 +1597,23 @@ void RdmaCommunication::post_b2_start(
   post_write_send(machine_id, buf_id, len, B2_START);
 }
 
-void RdmaCommunication::poll_b2_start(char *query_data, size_t &ef, uint32_t &qid) {
+// 返回 true  = 正常收到一个 query, 调用方可继续搜索
+// 返回 false = 收到 leader 的 TERMINATION 信号, 调用方应退出循环
+// (B2 member 在 leader 跑完所有 query 后会收到 term; 之前没有检测,
+//  member 永远卡在此处的 for(;;) 里等下一个 query, 无法输出统计)
+bool RdmaCommunication::poll_b2_start(char *query_data, size_t &ef, uint32_t &qid) {
   auto *rbuf = recv_write_buf.getLocal();  // recv buffer
 
   for (;;) {
     poll_send();
     poll_recv();
+
+    // 检测 leader 的 term 信号 (leader machine_id = 0).
+    // poll_recv() 收到 TERMINATION 时会设 term[0] = true.
+    // 收到后立即返回 false, 不再阻塞等 query.
+    if (term[0]) {
+      return false;
+    }
 
     // Collect recved partition info.
     if (rbuf->b2_start_queue.size() > 0) {
@@ -1462,7 +1632,7 @@ void RdmaCommunication::poll_b2_start(char *query_data, size_t &ef, uint32_t &qi
       free(b2_start_ptr);
       // std::cout << "Recv partition info :" << index_param.shard_base_file
       //           << std::endl;
-      break;
+      return true;
     }
   }
 }

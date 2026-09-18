@@ -8,6 +8,11 @@
 #include "rdma_context.h"
 #include "server_connect.h"
 
+#include <atomic>
+#include <cstdint>
+#include <deque>
+#include <mutex>
+
 #define KEY_MSG_SIZE (59 + 24 + 2) /* Message size without gid. */
 #define KEY_MSG_SIZE_GID (108)     /* Message size with gid (MGID as well). */
 #define SYNC_SPEC_ID (5)
@@ -46,6 +51,33 @@ class RdmaCommunication {
   // Indicator for termination.
   bool term[MACHINE_NUM];
 
+  // �── Term epoch (round id) ────────────────────────────────────────
+  // TERMINATION 消息的跨轮竞态修复: 快节点发出的下一轮 term 可能在慢节点
+  // 仍在当前轮 standby 时到达, 被误当作当前轮 term 消费掉, 导致:
+  //   (a) 当前轮聚合值 (correct/total/query_load/all_computation_cnt)
+  //       被下一轮 payload 污染;
+  //   (b) 下一轮 term 交换永远等不到该消息 -> 挂死.
+  // 修复: 每条 TERMINATION 携带 round id (term_round).
+  //   round == term_round  -> 正常应用 (与修复前行为一致);
+  //   round >  term_round  -> 暂存 future_terms, 等本节点进入该轮后应用;
+  //   round <  term_round  -> 丢弃 (陈旧消息).
+  // 所有节点必须以相同的次数/顺序调用 reset_term() (即 initTerm), 才能保证
+  // round 编号一致 — 当前代码里 warmup/正式轮/第二次 term 交换在所有节点
+  // 上完全对称, 满足此前提.
+  std::atomic<uint64_t> term_round{0};
+
+  struct FutureTerm {
+    uint64_t round;
+    int machine_id;
+    size_t correct;
+    size_t total;
+    size_t query_load;
+    double cumu_lat_us;
+    size_t computation_cnt;
+  };
+  std::deque<FutureTerm> future_terms;
+  std::mutex future_term_mtx;  // poll_recv 多线程并发, 仅 future 路径加锁
+
   int ethernet_leader_connect();
   int ethernet_member_connect(int leader_id);
   int establish_connection();
@@ -82,7 +114,7 @@ class RdmaCommunication {
       uint32_t query_id = 0);
   /* Sync wait post read request */
   int poll_read();
-  void release_cache(int buffer_id);
+  void release_cache(int buffer_id, uint32_t owner_thread);
   char *fetch_vector(uint32_t internal_id, size_t machine_id, size_t vec_size);
 
   /**
@@ -140,7 +172,22 @@ class RdmaCommunication {
     poll_send();
     poll_recv();
 
-    // printf("collect queues\n");
+    // // [DEBUG] Periodic poll_task_result state dump
+    // {
+    //   static thread_local uint64_t _dbg_ptr_cnt = 0;
+    //   _dbg_ptr_cnt++;
+    //   if (_dbg_ptr_cnt % 1000000 == 1) {
+    //     printf("[DBG-PTR][T%u] recv_task=%zu recv_res=%zu recv_node_res=%zu "
+    //            "recv_node_sync=%zu recv_compute=%zu migrate=%zu "
+    //            "core_info=%zu sync=%zu async_read=%zu\n",
+    //            (unsigned)ThreadPool::getTID(),
+    //            rbuf->recv_task.size(), rbuf->recv_result.size(),
+    //            rbuf->recv_node_res.size(), rbuf->recv_node_sync.size(),
+    //            rbuf->recv_compute.size(), rbuf->migrate_queue.size(),
+    //            rbuf->core_info_queue.size(), rbuf->sync_queue.size(),
+    //            rd_buf->recv_list.size());
+    //   }
+    // }
     // Collect recved tasks.
     while (rbuf->recv_task.size() > 0) {
 #ifdef PROFILER
@@ -488,12 +535,38 @@ class RdmaCommunication {
   template <typename dist_t>
   void post_remote_result(TaskManager<dist_t> &tman, uint32_t machine_id) {
     auto *buf = send_write_buf.getLocal();
-    uint32_t buf_id = get_write_send_buf(machine_id);
-    uint64_t offset = 0;
-    tman.serialize_result(machine_id, buf->buffer[machine_id][buf_id], offset);
-    // printf("post res to m%d buf%u\n", machine_id, buf_id);
-    post_write_send(machine_id, buf_id, offset, RESULT);
-    tman.result_queue[machine_id].clear();
+    if (tman.result_queue[machine_id].empty()) return;
+    std::vector<ResultMsg<dist_t>> local_q;
+    local_q.swap(tman.result_queue[machine_id]);
+    size_t idx = 0;
+    while (idx < local_q.size()) {
+      uint32_t buf_id = get_write_send_buf(machine_id);
+      uint64_t offset = 0;
+      memcpy(buf->buffer[machine_id][buf_id] + offset, &tman.local_id, sizeof(tman.local_id));
+      offset += sizeof(tman.local_id);
+      uint64_t r_size_offset = offset;
+      offset += sizeof(uint32_t);
+      size_t sent_cnt = 0;
+      while (idx < local_q.size()) {
+        auto &r = local_q[idx];
+        size_t est_next = offset + sizeof(uint32_t) * 4 +
+                          r.res.size() * sizeof(std::pair<dist_t, uint32_t>);
+        if (est_next > MAX_QUERYBUFFER_SIZE) {
+          if (sent_cnt == 0) {
+            printf("FATAL [post_remote_result(single)]: single ResultMsg q%u res_size=%zu does not fit in buffer (%zu>%u), aborting.\n",
+            r.qid, r.res.size(), est_next, MAX_QUERYBUFFER_SIZE);
+            abort();
+          }
+          break;
+        }
+        r.serialize(buf->buffer[machine_id][buf_id], offset);
+        sent_cnt++;
+        idx++;
+      }
+      uint32_t sent_cnt_u32 = (uint32_t)sent_cnt;
+      memcpy(buf->buffer[machine_id][buf_id] + r_size_offset, &sent_cnt_u32, sizeof(sent_cnt_u32));
+      post_write_send(machine_id, buf_id, offset, RESULT);
+    }
   }
 
   template <typename dist_t>
@@ -502,13 +575,36 @@ class RdmaCommunication {
 
     for (uint32_t m = 0; m < MACHINE_NUM; m++) {
       if (m == tman.local_id) continue;
-      if (tman.result_queue[m].size() > 0) {
+      while (tman.result_queue[m].size() > 0) {
         uint32_t buf_id = get_write_send_buf(m);
         uint64_t offset = 0;
-        tman.serialize_result(m, buf->buffer[m][buf_id], offset);
-        // printf("post res to m%d buf%u\n", m, buf_id);
+        // Header: local_id (uint32) + r_size (uint32), backfill r_size later.
+        memcpy(buf->buffer[m][buf_id] + offset, &tman.local_id, sizeof(tman.local_id));
+        offset += sizeof(tman.local_id);
+        uint64_t r_size_offset = offset;
+        offset += sizeof(uint32_t);  // placeholder for r_size
+        size_t sent_cnt = 0;
+        for (size_t idx = 0; idx < tman.result_queue[m].size(); ) {
+          auto &r = tman.result_queue[m][idx];
+          size_t est_next = offset + sizeof(uint32_t) * 3 + r.res.size() * sizeof(std::pair<dist_t, uint32_t>);
+          if (est_next > MAX_QUERYBUFFER_SIZE) {
+            if (sent_cnt == 0) {
+              printf("FATAL [post_remote_result(all)]: single ResultMsg q%u res_size=%zu does not fit in buffer (%zu>%u), aborting.\n",
+              r.qid, r.res.size(), est_next, MAX_QUERYBUFFER_SIZE);
+              abort();
+            }
+            break;
+          }
+          r.serialize(buf->buffer[m][buf_id], offset);
+          sent_cnt++;
+          idx++;
+        }
+        uint32_t sent_cnt_u32 = (uint32_t)sent_cnt;
+        memcpy(buf->buffer[m][buf_id] + r_size_offset, &sent_cnt_u32, sizeof(sent_cnt_u32));
+        tman.result_queue[m].erase(
+        tman.result_queue[m].begin(),
+        tman.result_queue[m].begin() + sent_cnt);
         post_write_send(m, buf_id, offset, RESULT);
-        tman.result_queue[m].clear();
       }
     }
   }
@@ -521,14 +617,35 @@ class RdmaCommunication {
   void post_node_result(TaskManager<dist_t> &tman, uint32_t m) {
     // Send NodeResult to original machine (NodeResult queue).
     auto *buf = send_write_buf.getLocal();
-    if (tman.node_result_queue[m].size() > 0) {
-      // std::cout << "]] post node res to origin:" << m << "\n";
+    while (tman.node_result_queue[m].size() > 0) {
       uint32_t buf_id = get_write_send_buf(m);
       uint64_t offset = 0;
-      tman.serialize_node_result(m, buf->buffer[m][buf_id], offset);
-      // printf("post res to m%d buf%u\n", m, buf_id);
+      memcpy(buf->buffer[m][buf_id] + offset, &tman.local_id, sizeof(tman.local_id));
+      offset += sizeof(tman.local_id);
+      uint64_t r_size_offset = offset;
+      offset += sizeof(uint32_t);
+      size_t sent_cnt = 0;
+      for (size_t idx = 0; idx < tman.node_result_queue[m].size(); ) {
+        auto &r = tman.node_result_queue[m][idx];
+        size_t est_next = offset + sizeof(uint32_t) * 3 + r.res.size() * sizeof(std::pair<dist_t, uint32_t>);
+        if (est_next > MAX_QUERYBUFFER_SIZE) {
+          if (sent_cnt == 0) {
+            printf("FATAL [post_node_result]: single NodeResult q%u res_size=%zu does not fit in buffer (%zu>%u), aborting.\n",
+            r.qid, r.res.size(), est_next, MAX_QUERYBUFFER_SIZE);
+            abort();
+          }
+          break;
+        }
+        r.serialize(buf->buffer[m][buf_id], offset);
+        sent_cnt++;
+        idx++;
+      }
+      uint32_t sent_cnt_u32 = (uint32_t)sent_cnt;
+      memcpy(buf->buffer[m][buf_id] + r_size_offset, &sent_cnt_u32, sizeof(sent_cnt_u32));
+      tman.node_result_queue[m].erase(
+      tman.node_result_queue[m].begin(),
+      tman.node_result_queue[m].begin() + sent_cnt);
       post_write_send(m, buf_id, offset, NODE_RESULT);
-      tman.node_result_queue[m].clear();
     }
   }
 
@@ -570,14 +687,31 @@ class RdmaCommunication {
     auto *buf = send_write_buf.getLocal();
     for (uint32_t m = 0; m < MACHINE_NUM; m++) {
       if (m == tman.local_id) continue;
-      if (tman.node_result_queue[m].size() > 0) {
-        // std::cout << "]] post node res to origin:" << m << "\n";
+      while (tman.node_result_queue[m].size() > 0) {
         uint32_t buf_id = get_write_send_buf(m);
         uint64_t offset = 0;
-        tman.serialize_node_result(m, buf->buffer[m][buf_id], offset);
-        // printf("post res to m%d buf%u\n", m, buf_id);
+        // Header: local_id (uint32) + r_size (uint32), backfill r_size later.
+        memcpy(buf->buffer[m][buf_id] + offset, &tman.local_id, sizeof(tman.local_id));
+        offset += sizeof(tman.local_id);
+        uint64_t r_size_offset = offset;
+        offset += sizeof(uint32_t);  // placeholder for r_size
+        // Serialize as many NodeResults as fit in one buffer.
+        size_t sent_cnt = 0;
+        for (size_t idx = 0; idx < tman.node_result_queue[m].size(); ) {
+          auto &r = tman.node_result_queue[m][idx];
+          size_t est_next = offset + sizeof(uint32_t) * 3 + r.res.size() * sizeof(std::pair<dist_t, uint32_t>);
+          if (est_next > MAX_QUERYBUFFER_SIZE && sent_cnt > 0) break;
+          r.serialize(buf->buffer[m][buf_id], offset);
+          sent_cnt++;
+          idx++;
+        }
+        // Backfill actual count.
+        uint32_t sent_cnt_u32 = (uint32_t)sent_cnt;
+        memcpy(buf->buffer[m][buf_id] + r_size_offset, &sent_cnt_u32, sizeof(sent_cnt_u32));
+        tman.node_result_queue[m].erase(
+        tman.node_result_queue[m].begin(),
+        tman.node_result_queue[m].begin() + sent_cnt);
         post_write_send(m, buf_id, offset, NODE_RESULT);
-        tman.node_result_queue[m].clear();
       }
     }
 
@@ -617,7 +751,8 @@ class RdmaCommunication {
   void build_sync();
 
   void post_b2_start(uint32_t machine_id, uint32_t qid, char *query, size_t query_size, size_t ef);
-  void poll_b2_start(char *query_data, size_t &ef, uint32_t &qid);
+  // 返回 true=正常收到query, false=收到leader的TERMINATION(member应退出)
+  bool poll_b2_start(char *query_data, size_t &ef, uint32_t &qid);
 
 
   template<typename dist_t>
