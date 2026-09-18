@@ -1,5 +1,7 @@
 #include "index/index_param.h"
 
+#include <sstream>
+
 #include "anns/anns_param.h"
 #include "diskann/include/program_options_utils.hpp"
 
@@ -7,6 +9,7 @@ AnnsParameter::AnnsParameter(int argc, char **argv, IndexParameter &index_param)
 
   po::options_description desc{program_options_utils::make_program_description(
       "build_disk_index", "Build a disk-based index.")};
+  po::variables_map vm;  // declared outside try so we can read it below
   try {
     desc.add_options()("help,h", "Print information on arguments");
 
@@ -61,19 +64,37 @@ AnnsParameter::AnnsParameter(int argc, char **argv, IndexParameter &index_param)
     optional_configs.add_options()(
         "query_size,Q", po::value<size_t>(&qsize)->default_value(10000),
         "default query size is 10000");
+
+    optional_configs.add_options()(
+        "search_ef_list",
+        po::value<std::string>()->default_value(""),
+        "Comma-separated ef values to sweep during search, e.g. \"50,100,200\". "
+        "When empty, uses the built-in default list.");
+
+    optional_configs.add_options()(
+        "warmup_runs", po::value<int>()->default_value(1),
+        "Number of untimed warmup passes before timed measurement (default 1, 0=skip).");
+    optional_configs.add_options()(
+        "warmup_ef", po::value<size_t>()->default_value(0),
+        "ef for warmup passes (0 = use max ef from --search_ef_list).");
+    optional_configs.add_options()(
+        "num_runs", po::value<int>()->default_value(10),
+        "Timed measurement repetitions per ef point; QPS reported as median (default 10, 1=old behaviour).");
     
     optional_configs.add_options()(
         "scala_v3", po::bool_switch()->default_value(false), "Search version");
+    optional_configs.add_options()(
+        "rank", po::value<int>()->default_value(-1),
+        "Explicit per-process rank in [0,MACHINE_NUM); required for "
+        "multi-process-per-node, overrides IP-based machine_id lookup.");
     // Merge required and optional parameters
     desc.add(required_configs).add(optional_configs);
     
 
-    po::variables_map vm;
-    auto parsed = po::command_line_parser(argc, argv)
+    po::store(po::command_line_parser(argc, argv)
           .options(desc)
           .allow_unregistered()
-          .run();
-    po::store(parsed, vm);
+          .run(), vm);
     
     // po::store(po::parse_command_line(argc, argv, desc, po::command_line_style::allow_unregistered), vm);
     if (vm.count("help")) {
@@ -86,7 +107,70 @@ AnnsParameter::AnnsParameter(int argc, char **argv, IndexParameter &index_param)
     abort();
   }
 
-  machine_id = get_machine_id(config_file);
+  // Parse --search_ef_list (comma-separated) into search_ef_list.
+  // Empty/unset → leave vector empty → exec_query.h uses built-in default.
+  {
+    std::string ef_str = vm["search_ef_list"].as<std::string>();
+    if (!ef_str.empty()) {
+      std::stringstream ss(ef_str);
+      std::string token;
+      while (std::getline(ss, token, ',')) {
+        // trim whitespace
+        size_t a = token.find_first_not_of(" \t");
+        size_t b = token.find_last_not_of(" \t");
+        if (a == std::string::npos) continue;
+        std::string trimmed = token.substr(a, b - a + 1);
+        if (trimmed.empty()) continue;
+        try {
+          size_t val = std::stoull(trimmed);
+          if (val == 0) {
+            std::cerr << "Error: --search_ef_list contains 0 (must be >= 1)\n";
+            abort();
+          }
+          search_ef_list.push_back(val);
+        } catch (const std::exception &e) {
+          std::cerr << "Error parsing --search_ef_list token '" << trimmed
+                    << "': " << e.what() << "\n";
+          abort();
+        }
+      }
+      if (search_ef_list.empty()) {
+        std::cerr << "Error: --search_ef_list specified but no valid values parsed\n";
+        abort();
+      }
+      printf("Search ef list (from CLI):");
+      for (size_t v : search_ef_list) printf(" %zu", v);
+      printf("\n");
+    }
+  }
+
+  // Parse warmup / repeat parameters.
+  {
+    warmup_runs = vm["warmup_runs"].as<int>();
+    warmup_ef   = vm["warmup_ef"].as<size_t>();
+    num_runs    = vm["num_runs"].as<int>();
+    if (num_runs < 1)    num_runs = 1;
+    if (warmup_runs < 0) warmup_runs = 0;
+    printf("Measurement: warmup_runs=%d  warmup_ef=%zu  num_runs=%d\n",
+           warmup_runs, warmup_ef, num_runs);
+  }
+
+  // machine_id: explicit --rank for multi-process-per-node, else IP-based
+  // lookup. The legacy constructor left this member unset; set it explicitly
+  // here so the search layer's self/leader comparisons use the real rank.
+  {
+    int rank = vm["rank"].as<int>();
+    if (rank >= 0) {
+      machine_id = rank;
+    } else {
+      machine_id = get_machine_id(config_file);
+    }
+    if (machine_id < 0 || machine_id >= MACHINE_NUM) {
+      std::cerr << "Error: rank/machine_id " << machine_id
+                << " is out of range [0," << MACHINE_NUM << ").\n";
+      abort();
+    }
+  }
   vecsize = index_param.vec_size;
   vecnum = subset_size_milllions * 1000000;
   if(vecnum != index_param.vec_num){
@@ -156,6 +240,8 @@ AnnsParameter::AnnsParameter(int argc, char **argv, IndexParameter &index_param)
 IndexParameter::IndexParameter(int argc, char **argv) {
   _meta_data_ratio = META_DATA_RATIO;
   num_parts = MACHINE_NUM;
+
+  int rank_override = -1;  // captured from --rank inside the try below
 
   std::cout << "Using meta_data_ratio: " << _meta_data_ratio << std::endl;
   po::options_description desc{program_options_utils::make_program_description(
@@ -273,6 +359,10 @@ IndexParameter::IndexParameter(int argc, char **argv) {
       "topindex_deg", po::value<uint32_t>(&topindex_deg)->default_value(16),
       "Top HNSW index degree");
     optional_configs.add_options()(
+        "rank", po::value<int>()->default_value(-1),
+        "Explicit per-process rank in [0,MACHINE_NUM); required for "
+        "multi-process-per-node, overrides IP-based machine_id lookup.");
+    optional_configs.add_options()(
       "sample_percent", po::value<std::string>(&top_sample_percent)->default_value("0.01"), 
       "Top index sampling rate");
     
@@ -297,12 +387,23 @@ IndexParameter::IndexParameter(int argc, char **argv) {
     po::notify(vm);
     if (vm["append_reorder_data"].as<bool>()) append_reorder_data = true;
     if (vm["use_opq"].as<bool>()) use_opq = true;
+    rank_override = vm["rank"].as<int>();
   } catch (const std::exception &ex) {
     std::cerr << ex.what() << '\n';
     abort();
   }
 
-  machine_id = get_machine_id(config_file);
+  // machine_id: explicit --rank for multi-process-per-node, else IP-based lookup.
+  if (rank_override >= 0) {
+    machine_id = static_cast<uint32_t>(rank_override);
+  } else {
+    machine_id = static_cast<uint32_t>(get_machine_id(config_file));
+  }
+  if (machine_id >= static_cast<uint32_t>(MACHINE_NUM)) {
+    std::cerr << "Error: rank/machine_id " << machine_id
+              << " is out of range [0," << MACHINE_NUM << ").\n";
+    abort();
+  }
 
   bool use_filters = (label_file != "") ? true : false;
   if (dist_fn == std::string("l2"))

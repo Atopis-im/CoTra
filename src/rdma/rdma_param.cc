@@ -54,10 +54,23 @@ int RdmaParameter::parser(commandLine &cmd) {
   }
 
   machine_num = MACHINE_NUM;
-  // machine_id = cmd.getOptionIntValue("-m", 0);
-  machine_id = get_machine_id(ip_config_file);
+  // machine_id: explicit --rank enables multi-process-per-node (several CoTra
+  // processes on one host sharing one RoCE NIC). When --rank is given, use it
+  // directly as the per-process machine_id and skip the IP->ID lookup, which
+  // cannot distinguish two processes that share the same local IP. When --rank
+  // is absent, fall back to the legacy IP-based lookup (one process per node).
+  {
+    char *rank_str = cmd.getOptionValue("--rank");
+    int rank = (rank_str != nullptr) ? atoi(rank_str) : -1;
+    if (rank >= 0) {
+      machine_id = rank;
+    } else {
+      machine_id = get_machine_id(ip_config_file);
+    }
+  }
   machine_name = get_machine_name(ip_config_file);
-  if (machine_id < 0 || machine_name.size() != MACHINE_NUM) {
+  if (machine_id < 0 || machine_id >= MACHINE_NUM ||
+      machine_name.size() != MACHINE_NUM) {
     fprintf(
         stderr,
         "RDMA config must contain exactly %d machines and one local address\n",

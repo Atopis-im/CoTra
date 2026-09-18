@@ -1,0 +1,145 @@
+CoTra minimal ARM/RDMA environment report
+Generated: Fri Aug  7 10:47:30 CST 2026
+Host: agent-21
+Output: ./tmp.2.log
+Effective user: uid=1218(alg_mathlib) gid=1212(hpcgrp) groups=1212(hpcgrp)
+
+=== OS ===
+Linux agent-21 4.19.90-24.4.v2101.ky10.aarch64 #1 SMP Mon May 24 14:45:37 CST 2021 aarch64 aarch64 aarch64 GNU/Linux
+NAME="Kylin Linux Advanced Server"
+VERSION="V10 (Sword)"
+ID="kylin"
+VERSION_ID="V10"
+PRETTY_NAME="Kylin Linux Advanced Server V10 (Sword)"
+ANSI_COLOR="0;31"
+
+
+=== CPU / NUMA / MEMORY ===
+Architecture:                    aarch64
+CPU op-mode(s):                  64-bit
+Byte Order:                      Little Endian
+CPU(s):                          96
+On-line CPU(s) list:             0-95
+Thread(s) per core:              1
+Core(s) per socket:              48
+Socket(s):                       2
+NUMA node(s):                    4
+Vendor ID:                       HiSilicon
+Model:                           0
+Model name:                      Kunpeng-920
+Stepping:                        0x1
+BogoMIPS:                        200.00
+L1d cache:                       6 MiB
+L1i cache:                       6 MiB
+L2 cache:                        48 MiB
+L3 cache:                        192 MiB
+NUMA node0 CPU(s):               0-23
+NUMA node1 CPU(s):               24-47
+NUMA node2 CPU(s):               48-71
+NUMA node3 CPU(s):               72-95
+Vulnerability Itlb multihit:     Not affected
+Vulnerability L1tf:              Not affected
+Vulnerability Mds:               Not affected
+Vulnerability Meltdown:          Not affected
+Vulnerability Spec store bypass: Vulnerable
+Vulnerability Spectre v1:        Mitigation; __user pointer sanitization
+Vulnerability Spectre v2:        Not affected
+Vulnerability Srbds:             Not affected
+Vulnerability Tsx async abort:   Not affected
+Flags:                           fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma dcpop asimddp asimdfhm
+available: 4 nodes (0-3)
+node 0 cpus: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23
+node 0 size: 64838 MB
+node 0 free: 40658 MB
+node 1 cpus: 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47
+node 1 size: 65456 MB
+node 1 free: 45807 MB
+node 2 cpus: 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71
+node 2 size: 65456 MB
+node 2 free: 61934 MB
+node 3 cpus: 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95
+node 3 size: 64431 MB
+node 3 free: 62498 MB
+node distances:
+node   0   1   2   3 
+  0:  10  16  32  33 
+  1:  16  10  25  32 
+  2:  32  25  10  16 
+  3:  33  32  16  10 
+              total        used        free      shared  buff/cache   available
+Mem:          254Gi        31Gi       205Gi       4.2Gi        16Gi       192Gi
+Swap:         4.0Gi          0B       4.0Gi
+AnonHugePages:         0 kB
+ShmemHugePages:        0 kB
+HugePages_Total:       0
+HugePages_Free:        0
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+Hugepagesize:     524288 kB
+Max locked memory         unlimited            unlimited            bytes     
+
+=== TOOLCHAIN ===
+g++ (GCC) 7.3.0
+[command not installed: cmake]
+
+=== RDMA ===
+    device          	   node GUID
+    ------          	----------------
+    mlx5_0          	10c3ab0300900be0
+    mlx5_1          	10c3ab0300900be1
+hca_id:	mlx5_0
+	transport:			InfiniBand (0)
+	fw_ver:				16.21.3002
+			state:			PORT_ACTIVE (4)
+			active_mtu:		4096 (5)
+			link_layer:		Ethernet
+hca_id:	mlx5_1
+	transport:			InfiniBand (0)
+	fw_ver:				16.21.3002
+			state:			PORT_DOWN (1)
+			active_mtu:		1024 (3)
+			link_layer:		Ethernet
+link mlx5_0/1 state ACTIVE physical_state LINK_UP netdev enp1s0f0 
+link mlx5_1/1 state DOWN physical_state DISABLED netdev enp1s0f1 
+
+=== NETWORK ===
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 
+ksdev0           UP             a4:00:e2:b5:c7:a6 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+enp189s0f1       UP             a4:00:e2:b5:c7:a7 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+enp125s0f0       DOWN           a4:00:e2:b5:c7:a5 <BROADCAST,MULTICAST> 
+veth             UP             9c:7d:a3:28:6f:f9 <BROADCAST,UP,LOWER_UP> 
+enp1s0f0         UP             10:c3:ab:8f:ff:3a <BROADCAST,MULTICAST,UP,LOWER_UP> 
+enp1s0f1         DOWN           10:c3:ab:8f:ff:3b <BROADCAST,MULTICAST> 
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+ksdev0           UP             71.54.52.21/16 fe80::a600:e2ff:feb5:c7a6/64 
+enp189s0f1       UP             10.44.123.250/24 fe80::a600:e2ff:feb5:c7a7/64 
+enp125s0f0       DOWN           
+veth             UP             fe80::9e7d:a3ff:fe28:6ff9/64 
+enp1s0f0         UP             33.40.10.121/24 33.41.10.121/24 fe80::12c3:abff:fe8f:ff3a/64 
+enp1s0f1         DOWN           
+default via 71.54.0.1 dev ksdev0 
+10.44.123.0/24 dev enp189s0f1 proto kernel scope link src 10.44.123.250 
+33.40.0.0/16 via 33.40.10.1 dev enp1s0f0 
+33.40.10.0/24 dev enp1s0f0 proto kernel scope link src 33.40.10.121 
+33.41.10.0/24 dev enp1s0f0 proto kernel scope link src 33.41.10.121 
+71.54.0.0/16 dev ksdev0 proto kernel scope link src 71.54.52.21 
+169.254.0.0/16 dev ksdev0 scope link metric 1002 
+169.254.0.0/16 dev enp189s0f1 scope link metric 1003 
+169.254.0.0/16 dev veth scope link metric 1007 
+169.254.0.0/16 dev enp1s0f0 scope link metric 1008 
+
+=== LIBRARIES ===
+-- libibverbs --
+1.14.35.0
+-- librdmacm --
+1.3.35.0
+	librdmacm.so.1 (libc6,AArch64) => /lib64/librdmacm.so.1
+	librdmacm.so (libc6,AArch64) => /lib64/librdmacm.so
+	libnuma.so.1 (libc6,AArch64) => /lib64/libnuma.so.1
+	libibverbs.so.1 (libc6,AArch64) => /lib64/libibverbs.so.1
+	libibverbs.so (libc6,AArch64) => /lib64/libibverbs.so
+
+=== SUMMARY ===
+Report complete: ./tmp.2.log
+Run this script as the non-root CoTra user; do not use sudo unless
+CoTra itself will run as root.
